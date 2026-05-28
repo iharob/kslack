@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <defs>
+    <style type="text/css" id="current-color-scheme">
+      .ColorScheme-Text { color:#232629; }
+    </style>
+  </defs>
+  <g fill="currentColor" class="ColorScheme-Text">
+    <!-- Stylised hashtag: two horizontal bars and two vertical bars, rounded.
+         Renders cleanly down to 22px. -->
+    <rect x="6"  y="17" width="36" height="5" rx="2.5"/>
+    <rect x="6"  y="26" width="36" height="5" rx="2.5"/>
+    <rect x="17" y="6"  width="5"  height="36" rx="2.5"/>
+    <rect x="26" y="6"  width="5"  height="36" rx="2.5"/>
+  </g>
+</svg>

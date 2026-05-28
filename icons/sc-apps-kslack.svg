@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <!-- Four interlocking rounded bars in the four Slack-quadrant colors.
+       Distinct shape, not a literal Slack logo trace. -->
+  <g>
+    <!-- top-left green bar (horizontal, sitting on the top-left) -->
+    <path fill="#2EB67D"
+          d="M10 13a3 3 0 0 1 0-6h11a3 3 0 0 1 0 6H10zm0 6h11v6H10a3 3 0 1 1 0-6z"/>
+    <!-- top-right yellow bar (vertical, sitting on the top-right) -->
+    <path fill="#ECB22E"
+          d="M35 10a3 3 0 0 1 6 0v11a3 3 0 0 1-6 0V10zm-6 0v11h-6v-11a3 3 0 1 1 6 0z"/>
+    <!-- bottom-right magenta bar (horizontal, sitting on the bottom-right) -->
+    <path fill="#E01E5A"
+          d="M38 35a3 3 0 0 1 0 6H27a3 3 0 0 1 0-6h11zm0-6H27v-6h11a3 3 0 1 1 0 6z"/>
+    <!-- bottom-left blue bar (vertical, sitting on the bottom-left) -->
+    <path fill="#36C5F0"
+          d="M13 38a3 3 0 0 1-6 0V27a3 3 0 0 1 6 0v11zm6 0V27h6v11a3 3 0 1 1-6 0z"/>
+  </g>
+</svg>

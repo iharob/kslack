@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="kslack.svg">sc-apps-kslack.svg</file>
+        <file alias="kslack-tray.svg">sc-status-kslack-tray.svg</file>
+    </qresource>
+</RCC>

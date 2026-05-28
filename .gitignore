@@ -1,0 +1,7 @@
+build/
+*.user
+.cache/
+compile_commands.json
+.kdev4/
+*.kdev4
+CMakeUserPresets.json

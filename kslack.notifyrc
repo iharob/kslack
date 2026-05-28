@@ -1,0 +1,9 @@
+[Global]
+IconName=kslack
+Name=KSlack
+Comment=Slack Client
+
+[Event/webNotification]
+Name=Web Notification
+Comment=Notification from Slack
+Action=Popup

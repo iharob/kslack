@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=KSlack
+GenericName=Slack Client
+Comment=Access Slack from your desktop
+Exec=kslack
+Icon=kslack
+Terminal=false
+Categories=Qt;KDE;Network;InstantMessaging;
+StartupWMClass=kslack
+X-DBUS-ServiceName=org.kde.kslack
