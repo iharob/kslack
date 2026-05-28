@@ -523,6 +523,13 @@ static QColor parseCssColor(const QString &css)
 
 void MainWindow::applyChromeColor(const QString &cssColor)
 {
+    // Skip if the JS observer reported the same CSS value as last time
+    // (page reload / observer re-init can fire a duplicate). Saves the
+    // grab() cost when nothing actually changed.
+    if (cssColor == m_lastChromeCss)
+        return;
+    m_lastChromeCss = cssColor;
+
     // The CSS variable is a useful "something changed" signal but not the
     // colour that's actually painted (Slack composites a semi-transparent
     // workspace-rail over p-theme_background). Use the variable change to

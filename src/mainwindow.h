@@ -45,6 +45,7 @@ private:
     KStatusNotifierItem *m_trayIcon = nullptr;
     TitlebarColorWatcher *m_titlebar = nullptr;
     BadgeState m_badgeState = BadgeState::None;
+    QString m_lastChromeCss;
 };
 
 #endif
