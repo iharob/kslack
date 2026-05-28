@@ -24,6 +24,9 @@ public:
     bool importFromChrome();
     void finishImport(bool ok);
 
+public Q_SLOTS:
+    void applyChromeColor(const QString &cssColor);
+
 protected:
     void closeEvent(QCloseEvent *event) override;
 

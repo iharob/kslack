@@ -17,6 +17,8 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QProcess>
+#include <QSet>
+#include <QSharedPointer>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -32,8 +34,10 @@
 #include <QWidget>
 
 #include <KActionCollection>
+#include <KConfigGroup>
 #include <KLocalizedString>
 #include <KNotification>
+#include <KSharedConfig>
 #include <KStandardAction>
 #include <KStatusNotifierItem>
 
@@ -44,11 +48,54 @@ static const QString userAgent = QStringLiteral(
 static const QString slackUrl = QStringLiteral("https://app.slack.com/");
 static const QString slackSignInUrl = QStringLiteral("https://slack.com/signin");
 
+static QString lastWorkspaceUrl()
+{
+    KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Session"));
+    const QString teamId = config.readEntry(QStringLiteral("lastTeam"), QString());
+    if (teamId.isEmpty())
+        return slackUrl;
+    return QStringLiteral("https://app.slack.com/client/") + teamId;
+}
+
+static void rememberWorkspace(const QUrl &url)
+{
+    // Match https://app.slack.com/client/<TEAMID>...; team IDs start with 'T'.
+    if (url.host() != QStringLiteral("app.slack.com"))
+        return;
+    const auto segments = url.path().split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    if (segments.size() < 2 || segments[0] != QStringLiteral("client"))
+        return;
+    const auto teamId = segments[1];
+    if (teamId.size() < 2 || teamId[0] != QLatin1Char('T'))
+        return;
+    KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Session"));
+    if (config.readEntry(QStringLiteral("lastTeam"), QString()) == teamId)
+        return;
+    config.writeEntry(QStringLiteral("lastTeam"), teamId);
+    config.sync();
+}
+
 static bool isSlackHost(const QString &host)
 {
     return host == QStringLiteral("app.slack.com")
         || host == QStringLiteral("slack.com")
         || host.endsWith(QStringLiteral(".slack.com"));
+}
+
+// Hosts that participate in Slack's sign-in flow. We keep them in our view
+// (and thus our cookie jar) even on user-initiated link clicks, because
+// punting them to a separate browser context breaks the OAuth state and
+// you get cryptic 400 errors from the IdP.
+static bool isAuthProviderHost(const QString &host)
+{
+    return host.endsWith(QStringLiteral(".google.com"))
+        || host.endsWith(QStringLiteral(".gstatic.com"))
+        || host == QStringLiteral("appleid.apple.com")
+        || host == QStringLiteral("login.microsoftonline.com")
+        || host.endsWith(QStringLiteral(".onelogin.com"))
+        || host.endsWith(QStringLiteral(".okta.com"))
+        || host.endsWith(QStringLiteral(".auth0.com"))
+        || host.endsWith(QStringLiteral(".duosecurity.com"));
 }
 
 static void openInBrowser(const QUrl &url)
@@ -95,12 +142,40 @@ protected:
         // Slack's server to IdPs (RedirectNavigation = 6), back/forward, reload,
         // OtherNavigation — stays inside our view, so the OAuth round-trip
         // completes in our cookie jar.
-        if (type == NavigationTypeLinkClicked && !isSlackHost(url.host())) {
+        if (type == NavigationTypeLinkClicked
+            && !isSlackHost(url.host())
+            && !isAuthProviderHost(url.host())) {
             openInBrowser(url);
             return false;
         }
 
         return true;
+    }
+
+    void javaScriptConsoleMessage(JavaScriptConsoleMessageLevel level,
+                                  const QString &message,
+                                  int lineNumber,
+                                  const QString &sourceID) override
+    {
+        // Color-watcher channel: messages starting with our marker carry
+        // the chrome colour the JS observer just read. Forward to the owner.
+        if (message.startsWith(QStringLiteral("__kslack_chrome__:"))) {
+            // Body is "rgb(R, G, B)|via=<selector>". Strip the via= for the slot.
+            const QString body = message.mid(18);
+            const int sep = body.indexOf(QStringLiteral("|via="));
+            const QString colorOnly = sep > 0 ? body.left(sep) : body;
+            qWarning().noquote() << "[kslack/chrome] reported" << body;
+            QMetaObject::invokeMethod(m_owner, "applyChromeColor",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, colorOnly));
+            return;
+        }
+        if (message.startsWith(QStringLiteral("__kslack_debug__:"))) {
+            qWarning().noquote() << "[kslack/chrome] top chain"
+                                 << message.mid(17);
+            return;
+        }
+        QWebEnginePage::javaScriptConsoleMessage(level, message, lineNumber, sourceID);
     }
 
 private:
@@ -112,10 +187,33 @@ MainWindow::MainWindow(QWidget *parent)
 {
     auto *profile = new QWebEngineProfile(QStringLiteral("kslack"), this);
     profile->setHttpUserAgent(userAgent);
-    // Slack sets the d-s session cookie with no expiry, so a normal browser
-    // drops it on shutdown and you have to re-auth on every cold start.
-    // ForcePersistentCookies keeps session cookies on disk too.
     profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
+
+    // ForcePersistentCookies keeps the on-disk file but Chromium still marks
+    // rows from no-expiry Set-Cookie headers as is_persistent=0 and drops
+    // them on restart. Slack relies on a session-scoped `d-s` cookie for
+    // "active device" state — without it we hit the sign-in flow on every
+    // cold start. Intercept Slack session cookies as they're added and
+    // re-set them with a far-future expiry so is_persistent flips to 1.
+    auto *cookies = profile->cookieStore();
+    auto seen = QSharedPointer<QSet<QString>>::create();
+    connect(cookies, &QWebEngineCookieStore::cookieAdded, this,
+            [cookies, seen](const QNetworkCookie &cookie) {
+        const QString domain = cookie.domain();
+        if (!domain.endsWith(QStringLiteral("slack.com")))
+            return;
+        if (cookie.expirationDate().isValid())
+            return; // already persistent, leave alone
+        const QString key = domain + QLatin1Char('|') + cookie.path()
+                            + QLatin1Char('|') + QString::fromUtf8(cookie.name());
+        if (seen->contains(key))
+            return; // we just re-inserted this one — skip to avoid a loop
+        seen->insert(key);
+        QNetworkCookie persistent = cookie;
+        persistent.setExpirationDate(QDateTime::currentDateTime().addYears(1));
+        cookies->deleteCookie(cookie);
+        cookies->setCookie(persistent);
+    });
     profile->setNotificationPresenter([this](std::unique_ptr<QWebEngineNotification> n) {
         handleNotification(std::move(n));
     });
@@ -136,6 +234,53 @@ MainWindow::MainWindow(QWidget *parent)
     script.setWorldId(QWebEngineScript::ApplicationWorld);
     script.setRunsOnSubFrames(false);
     m_view->page()->scripts().insert(script);
+
+    // Chrome-colour observer: walk a fallback chain of known Slack chrome
+    // selectors and report the first non-transparent backgroundColor we find.
+    // Only watches class/style/data-theme attribute swings on <html> and
+    // <body> (Slack's theme system flips those) — no subtree, no childList,
+    // so it's silent while Slack's React tree mutates. Debounced 150 ms.
+    QWebEngineScript colorObserver;
+    colorObserver.setSourceCode(QStringLiteral(
+        "(function() {"
+        "  var last = '';"
+        "  var timer = null;"
+        "  function topColor() {"
+        "    var v = getComputedStyle(document.documentElement)"
+        "                .getPropertyValue('--p-team_sidebar__nav-bg').trim();"
+        "    if (v) return v;"
+        "    var v2 = getComputedStyle(document.documentElement)"
+        "                 .getPropertyValue('--sk_primary_background').trim();"
+        "    if (v2) return v2;"
+        "    return getComputedStyle(document.body).backgroundColor;"
+        "  }"
+        "  function report() {"
+        "    timer = null;"
+        "    var c = topColor();"
+        "    if (c && c !== last) {"
+        "      last = c;"
+        "      console.log('__kslack_chrome__:' + c);"
+        "    }"
+        "  }"
+        "  function schedule() {"
+        "    if (timer) return;"
+        "    timer = setTimeout(report, 150);"
+        "  }"
+        "  schedule();"
+        "  var mo = new MutationObserver(schedule);"
+        "  mo.observe(document.documentElement, {"
+        "    attributes: true, attributeFilter: ['class', 'style', 'data-theme']"
+        "  });"
+        "  mo.observe(document.body, {"
+        "    attributes: true, attributeFilter: ['class', 'style', 'data-theme']"
+        "  });"
+        "  setInterval(report, 5000);"
+        "})();"
+    ));
+    colorObserver.setInjectionPoint(QWebEngineScript::DocumentReady);
+    colorObserver.setWorldId(QWebEngineScript::MainWorld);
+    colorObserver.setRunsOnSubFrames(false);
+    m_view->page()->scripts().insert(colorObserver);
 
     connect(m_view->page(), &QWebEnginePage::permissionRequested,
             this, &MainWindow::handlePermission);
@@ -199,7 +344,9 @@ MainWindow::MainWindow(QWidget *parent)
     layout->addWidget(m_view);
     setCentralWidget(container);
 
-    m_view->load(QUrl(slackUrl));
+    m_view->load(QUrl(lastWorkspaceUrl()));
+
+    connect(m_view, &QWebEngineView::urlChanged, this, &rememberWorkspace);
 
     setupActions();
     setupTrayIcon();
@@ -347,6 +494,39 @@ void MainWindow::applyBadge(BadgeState state)
     m_trayIcon->setToolTipSubTitle(state == BadgeState::Mention
         ? i18n("Mentions waiting")
         : i18n("Unread messages"));
+}
+
+static QColor parseCssColor(const QString &css)
+{
+    const QString trimmed = css.trimmed();
+    // QColor parses #RGB / #RRGGBB / #RRGGBBAA and named colours directly.
+    QColor c(trimmed);
+    if (c.isValid())
+        return c;
+    // Fall back to rgb()/rgba() syntax.
+    const auto open = trimmed.indexOf(QLatin1Char('('));
+    const auto close = trimmed.indexOf(QLatin1Char(')'));
+    if (open <= 0 || close <= open)
+        return QColor();
+    const auto parts = trimmed.mid(open + 1, close - open - 1)
+                              .split(QLatin1Char(','), Qt::SkipEmptyParts);
+    if (parts.size() < 3)
+        return QColor();
+    bool ok1, ok2, ok3;
+    const int r = parts[0].trimmed().toInt(&ok1);
+    const int g = parts[1].trimmed().toInt(&ok2);
+    const int b = parts[2].trimmed().toInt(&ok3);
+    if (!ok1 || !ok2 || !ok3)
+        return QColor();
+    return QColor(r, g, b);
+}
+
+void MainWindow::applyChromeColor(const QString &cssColor)
+{
+    const QColor color = parseCssColor(cssColor);
+    if (!color.isValid() || !m_titlebar)
+        return;
+    m_titlebar->applyExternal(color);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

@@ -51,10 +51,12 @@ void writeSchemeFile(const QColor &bg, const QColor &fg)
     KConfigGroup wm(config, QStringLiteral("WM"));
     wm.writeEntry(QStringLiteral("activeBackground"), rgbTriplet(bg));
     wm.writeEntry(QStringLiteral("activeForeground"), rgbTriplet(fg));
-    wm.writeEntry(QStringLiteral("activeBlend"), rgbTriplet(fg));
+    // Blend = background so Breeze doesn't lighten/darken the titlebar with a
+    // gradient highlight; we want the exact colour Slack defines.
+    wm.writeEntry(QStringLiteral("activeBlend"), rgbTriplet(bg));
     wm.writeEntry(QStringLiteral("inactiveBackground"), rgbTriplet(bg));
     wm.writeEntry(QStringLiteral("inactiveForeground"), rgbTriplet(fg));
-    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(fg));
+    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(bg));
 
     for (const QString &section : {QStringLiteral("Colors:Header"),
                                    QStringLiteral("Colors:Header][Inactive"),
@@ -82,18 +84,9 @@ TitlebarColorWatcher::TitlebarColorWatcher(QWebEngineView *view, QObject *parent
     , m_view(view)
     , m_timer(new QTimer(this))
 {
-    m_timer->setInterval(kSampleIntervalMs);
-    connect(m_timer, &QTimer::timeout, this, &TitlebarColorWatcher::sample);
-
     connect(view, &QWebEngineView::loadFinished, this, [this](bool ok) {
-        if (!ok)
-            return;
-        m_ready = true;
-        QTimer::singleShot(250, this, &TitlebarColorWatcher::sample);
-    });
-    connect(view, &QWebEngineView::urlChanged, this, [this](const QUrl &) {
-        if (m_ready)
-            QTimer::singleShot(250, this, &TitlebarColorWatcher::sample);
+        if (ok)
+            m_ready = true;
     });
 }
 
@@ -103,7 +96,17 @@ void TitlebarColorWatcher::start()
     const QColor fallback(0x4A, 0x15, 0x4B);
     writeSchemeFile(fallback, pickForeground(fallback));
     apply(fallback);
-    m_timer->start();
+    // The JS-side observer (mainwindow.cpp) drives all subsequent updates via
+    // applyExternal(). The grab-based sampler stays compiled but unused.
+}
+
+void TitlebarColorWatcher::applyExternal(const QColor &color)
+{
+    if (!color.isValid())
+        return;
+    if (m_lastApplied.isValid() && close(color, m_lastApplied))
+        return;
+    apply(color);
 }
 
 void TitlebarColorWatcher::sample()
