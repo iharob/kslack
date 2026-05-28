@@ -40,8 +40,19 @@ QColor pickForeground(const QColor &bg)
     return y < 140 ? QColor(252, 252, 252) : QColor(35, 38, 41);
 }
 
+// Mirror Slack's own `.p-window--blurred .p-theme_background { filter: brightness(0.9); }`
+// so the titlebar dims by exactly the same amount as the content when the
+// window loses focus.
+QColor dimForInactive(const QColor &c)
+{
+    return QColor(qRound(c.red() * 0.9), qRound(c.green() * 0.9), qRound(c.blue() * 0.9));
+}
+
 void writeSchemeFile(const QColor &bg, const QColor &fg)
 {
+    const QColor bgInactive = dimForInactive(bg);
+    const QColor fgInactive = dimForInactive(fg);
+
     auto config = KSharedConfig::openConfig(schemeFilePath(), KConfig::SimpleConfig);
 
     KConfigGroup general(config, QStringLiteral("General"));
@@ -54,19 +65,27 @@ void writeSchemeFile(const QColor &bg, const QColor &fg)
     // Blend = background so Breeze doesn't lighten/darken the titlebar with a
     // gradient highlight; we want the exact colour Slack defines.
     wm.writeEntry(QStringLiteral("activeBlend"), rgbTriplet(bg));
-    wm.writeEntry(QStringLiteral("inactiveBackground"), rgbTriplet(bg));
-    wm.writeEntry(QStringLiteral("inactiveForeground"), rgbTriplet(fg));
-    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(bg));
+    wm.writeEntry(QStringLiteral("inactiveBackground"), rgbTriplet(bgInactive));
+    wm.writeEntry(QStringLiteral("inactiveForeground"), rgbTriplet(fgInactive));
+    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(bgInactive));
 
-    for (const QString &section : {QStringLiteral("Colors:Header"),
-                                   QStringLiteral("Colors:Header][Inactive"),
-                                   QStringLiteral("Colors:Window")}) {
-        KConfigGroup g(config, section);
-        g.writeEntry(QStringLiteral("BackgroundNormal"), rgbTriplet(bg));
-        g.writeEntry(QStringLiteral("BackgroundAlternate"), rgbTriplet(bg));
-        g.writeEntry(QStringLiteral("ForegroundNormal"), rgbTriplet(fg));
-        g.writeEntry(QStringLiteral("ForegroundInactive"), rgbTriplet(fg));
-    }
+    auto writeColorGroup = [&](const QString &parentName) {
+        KConfigGroup parent(config, parentName);
+        parent.writeEntry(QStringLiteral("BackgroundNormal"), rgbTriplet(bg));
+        parent.writeEntry(QStringLiteral("BackgroundAlternate"), rgbTriplet(bg));
+        parent.writeEntry(QStringLiteral("ForegroundNormal"), rgbTriplet(fg));
+        parent.writeEntry(QStringLiteral("ForegroundInactive"), rgbTriplet(fg));
+        // [<parent>][Inactive] — use the sub-group API; passing the literal
+        // string "<parent>][Inactive" makes KConfig escape the brackets and
+        // KWin never finds the group.
+        KConfigGroup inactive = parent.group(QStringLiteral("Inactive"));
+        inactive.writeEntry(QStringLiteral("BackgroundNormal"), rgbTriplet(bgInactive));
+        inactive.writeEntry(QStringLiteral("BackgroundAlternate"), rgbTriplet(bgInactive));
+        inactive.writeEntry(QStringLiteral("ForegroundNormal"), rgbTriplet(fgInactive));
+        inactive.writeEntry(QStringLiteral("ForegroundInactive"), rgbTriplet(fgInactive));
+    };
+    writeColorGroup(QStringLiteral("Colors:Header"));
+    writeColorGroup(QStringLiteral("Colors:Window"));
 
     config->sync();
 }
@@ -151,6 +170,9 @@ void TitlebarColorWatcher::sample()
 
 void TitlebarColorWatcher::apply(const QColor &background)
 {
+    const bool sameAsLast = m_lastApplied.isValid()
+        && background.rgb() == m_lastApplied.rgb();
+
     const QColor fg = pickForeground(background);
     writeSchemeFile(background, fg);
 
@@ -159,7 +181,7 @@ void TitlebarColorWatcher::apply(const QColor &background)
     qWarning().noquote() << "[kslack/titlebar] apply" << background.name()
                           << "fg=" << fg.name()
                           << "schemeIndex.isValid=" << idx.isValid();
-    if (idx.isValid()) {
+    if (idx.isValid() && !sameAsLast) {
         // KWin treats activate-same-scheme-twice as a no-op for the decoration,
         // so flip through the default scheme first to force a re-read.
         mgr->activateScheme(QModelIndex());

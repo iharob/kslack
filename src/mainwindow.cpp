@@ -11,10 +11,12 @@
 #include <QFile>
 #include <QIcon>
 #include <QMenuBar>
+#include <QStatusBar>
 #include <QWebEngineNewWindowRequest>
 #include <QMessageBox>
 #include <QNetworkCookie>
 #include <QPainter>
+#include <optional>
 #include <QPixmap>
 #include <QProcess>
 #include <QSet>
@@ -48,31 +50,70 @@ static const QString userAgent = QStringLiteral(
 static const QString slackUrl = QStringLiteral("https://app.slack.com/");
 static const QString slackSignInUrl = QStringLiteral("https://slack.com/signin");
 
-static QString lastWorkspaceUrl()
+static QString readLastTeam()
 {
     KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Session"));
-    const QString teamId = config.readEntry(QStringLiteral("lastTeam"), QString());
+    return config.readEntry(QStringLiteral("lastTeam"), QString());
+}
+
+static QString lastWorkspaceUrl()
+{
+    const QString teamId = readLastTeam();
     if (teamId.isEmpty())
         return slackUrl;
     return QStringLiteral("https://app.slack.com/client/") + teamId;
 }
 
-static void rememberWorkspace(const QUrl &url)
+// Extract the T-prefixed team ID from a Slack client URL, or empty.
+static QString teamIdFromUrl(const QUrl &url)
 {
-    // Match https://app.slack.com/client/<TEAMID>...; team IDs start with 'T'.
     if (url.host() != QStringLiteral("app.slack.com"))
-        return;
+        return {};
     const auto segments = url.path().split(QLatin1Char('/'), Qt::SkipEmptyParts);
     if (segments.size() < 2 || segments[0] != QStringLiteral("client"))
-        return;
+        return {};
     const auto teamId = segments[1];
     if (teamId.size() < 2 || teamId[0] != QLatin1Char('T'))
+        return {};
+    return teamId;
+}
+
+static void rememberWorkspace(const QUrl &url)
+{
+    const QString teamId = teamIdFromUrl(url);
+    if (teamId.isEmpty())
         return;
     KConfigGroup config(KSharedConfig::openConfig(), QStringLiteral("Session"));
     if (config.readEntry(QStringLiteral("lastTeam"), QString()) == teamId)
         return;
     config.writeEntry(QStringLiteral("lastTeam"), teamId);
     config.sync();
+}
+
+static std::optional<QColor> cachedColorFor(const QString &teamId)
+{
+    if (teamId.isEmpty())
+        return std::nullopt;
+    KConfigGroup group(KSharedConfig::openConfig(), QStringLiteral("WorkspaceThemes"));
+    const QString hex = group.readEntry(teamId, QString());
+    if (hex.isEmpty())
+        return std::nullopt;
+    QColor c(hex);
+    if (!c.isValid())
+        return std::nullopt;
+    return c;
+}
+
+static void setCachedColorFor(const QString &teamId, const QColor &c)
+{
+    if (teamId.isEmpty() || !c.isValid())
+        return;
+    KConfigGroup group(KSharedConfig::openConfig(), QStringLiteral("WorkspaceThemes"));
+    const QString hex = c.name();
+    if (group.readEntry(teamId, QString()) == hex)
+        return;
+    group.writeEntry(teamId, hex);
+    group.sync();
 }
 
 static bool isSlackHost(const QString &host)
@@ -221,6 +262,9 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_view = new QWebEngineView(this);
     m_view->setPage(new SlackPage(profile, this));
+    // No Chromium-default right-click menu (Reload / Back / Inspect ...).
+    // Slack itself provides the only context menus that should appear in chat.
+    m_view->setContextMenuPolicy(Qt::NoContextMenu);
 
     QWebEngineScript script;
     script.setSourceCode(QStringLiteral(
@@ -235,28 +279,25 @@ MainWindow::MainWindow(QWidget *parent)
     script.setRunsOnSubFrames(false);
     m_view->page()->scripts().insert(script);
 
-    // Chrome-colour observer: walk a fallback chain of known Slack chrome
-    // selectors and report the first non-transparent backgroundColor we find.
-    // Only watches class/style/data-theme attribute swings on <html> and
-    // <body> (Slack's theme system flips those) — no subtree, no childList,
-    // so it's silent while Slack's React tree mutates. Debounced 150 ms.
+    // Chrome-colour observer: read the *unfiltered* background-color of the
+    // .p-theme_background element. In IA4 Slack, every layer above it is
+    // transparent, so this element's bg is exactly what gets painted at the
+    // top — except when the window is blurred, Slack adds
+    //   .p-window--blurred .p-theme_background { filter: brightness(0.9); }
+    // which we deliberately ignore (we want titlebar invariant to focus).
+    // The MutationObserver is anchored on .p-theme_background itself, so
+    // body's p-window--blurred class swings never trigger us.
     QWebEngineScript colorObserver;
     colorObserver.setSourceCode(QStringLiteral(
         "(function() {"
         "  var last = '';"
         "  var timer = null;"
-        "  function topColor() {"
-        "    var v = getComputedStyle(document.documentElement)"
-        "                .getPropertyValue('--p-team_sidebar__nav-bg').trim();"
-        "    if (v) return v;"
-        "    var v2 = getComputedStyle(document.documentElement)"
-        "                 .getPropertyValue('--sk_primary_background').trim();"
-        "    if (v2) return v2;"
-        "    return getComputedStyle(document.body).backgroundColor;"
-        "  }"
+        "  var inner = null;"
         "  function report() {"
         "    timer = null;"
-        "    var c = topColor();"
+        "    var el = document.querySelector('.p-theme_background');"
+        "    if (!el) return;"
+        "    var c = getComputedStyle(el).backgroundColor;"
         "    if (c && c !== last) {"
         "      last = c;"
         "      console.log('__kslack_chrome__:' + c);"
@@ -266,14 +307,26 @@ MainWindow::MainWindow(QWidget *parent)
         "    if (timer) return;"
         "    timer = setTimeout(report, 50);"
         "  }"
-        "  schedule();"
-        "  var mo = new MutationObserver(schedule);"
-        "  mo.observe(document.documentElement, {"
-        "    attributes: true, attributeFilter: ['class', 'style', 'data-theme']"
-        "  });"
-        "  mo.observe(document.body, {"
-        "    attributes: true, attributeFilter: ['class', 'style', 'data-theme']"
-        "  });"
+        "  function attach(el) {"
+        "    if (inner) return;"
+        "    inner = new MutationObserver(schedule);"
+        "    inner.observe(el, { attributes: true });"
+        "    schedule();"
+        "  }"
+        "  var existing = document.querySelector('.p-theme_background');"
+        "  if (existing) {"
+        "    attach(existing);"
+        "  } else {"
+        "    var wait = new MutationObserver(function() {"
+        "      var el = document.querySelector('.p-theme_background');"
+        "      if (el) {"
+        "        wait.disconnect();"
+        "        attach(el);"
+        "      }"
+        "    });"
+        "    wait.observe(document.body || document.documentElement,"
+        "                 { childList: true, subtree: true });"
+        "  }"
         "  setInterval(report, 5000);"
         "})();"
     ));
@@ -326,6 +379,29 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_view, &QWebEngineView::titleChanged,
             this, &MainWindow::updateBadgeFromTitle);
 
+    m_titlebar = new TitlebarColorWatcher(m_view, this);
+    m_titlebar->start();
+
+    // Track which workspace we're on (used by applyChromeColor to key the
+    // cache writes). We deliberately do NOT apply the cached color here —
+    // urlChanged fires *before* Slack tears down the old workspace and
+    // mounts the new one, so changing the titlebar at this point looks
+    // jarring against the still-visible old content. Instead, the JS
+    // observer on .p-theme_background fires when the new workspace's
+    // theme is actually painted, and applyChromeColor takes it from there.
+    // (Cold start is a different story — m_view hasn't loaded anything,
+    // so we pre-render from the cache *before* m_view->load(), further down.)
+    connect(m_view, &QWebEngineView::urlChanged, this, [this](const QUrl &url) {
+        const QString teamId = teamIdFromUrl(url);
+        if (teamId.isEmpty() || teamId == m_currentTeamId)
+            return;
+        m_currentTeamId = teamId;
+        // Force the next JS report through the dedupe check even if the
+        // rgb string happens to match the previous workspace's — we want
+        // the cache write keyed to the new team ID.
+        m_lastChromeCss.clear();
+    });
+
     // /ssb/redirect is a "tell desktop to load workspace" page that hangs
     // without Electron IPC. Jump to /client/ ourselves — with plain Chrome
     // UA Slack's web client renders normally there.
@@ -337,6 +413,8 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
 
+    connect(m_view, &QWebEngineView::urlChanged, this, &rememberWorkspace);
+
     auto *container = new QWidget(this);
     auto *layout = new QVBoxLayout(container);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -344,9 +422,15 @@ MainWindow::MainWindow(QWidget *parent)
     layout->addWidget(m_view);
     setCentralWidget(container);
 
-    m_view->load(QUrl(lastWorkspaceUrl()));
+    // Apply the cached color for lastTeam before kicking off the load, so the
+    // titlebar is right from the moment the window first paints.
+    const QString lastTeam = readLastTeam();
+    if (auto c = cachedColorFor(lastTeam)) {
+        m_currentTeamId = lastTeam;
+        m_titlebar->applyExternal(*c);
+    }
 
-    connect(m_view, &QWebEngineView::urlChanged, this, &rememberWorkspace);
+    m_view->load(QUrl(lastWorkspaceUrl()));
 
     setupActions();
     setupTrayIcon();
@@ -354,10 +438,11 @@ MainWindow::MainWindow(QWidget *parent)
 
     menuBar()->setVisible(false);
     menuBar()->setMaximumHeight(0);
+    if (auto *sb = findChild<QStatusBar *>()) {
+        sb->setVisible(false);
+        sb->setMaximumHeight(0);
+    }
     setProperty("_breeze_no_separator", true);
-
-    m_titlebar = new TitlebarColorWatcher(m_view, this);
-    m_titlebar->start();
 
     resize(1280, 800);
 }
@@ -523,49 +608,17 @@ static QColor parseCssColor(const QString &css)
 
 void MainWindow::applyChromeColor(const QString &cssColor)
 {
-    // Skip if the JS observer reported the same CSS value as last time
-    // (page reload / observer re-init can fire a duplicate). Saves the
-    // grab() cost when nothing actually changed.
     if (cssColor == m_lastChromeCss)
         return;
     m_lastChromeCss = cssColor;
-
-    // The CSS variable is a useful "something changed" signal but not the
-    // colour that's actually painted (Slack composites a semi-transparent
-    // workspace-rail over p-theme_background). Use the variable change to
-    // *trigger* a literal pixel read of the top-left painted area so the
-    // titlebar matches what the user actually sees.
     if (!m_titlebar)
         return;
-
-    QPixmap grab = m_view->grab(QRect(0, 0, qMin(64, m_view->width()),
-                                      qMin(16, m_view->height())));
-    if (grab.isNull()) {
-        // Fall back to the CSS value if grab() didn't produce anything
-        // (e.g. view not yet realised).
-        const QColor color = parseCssColor(cssColor);
-        if (color.isValid())
-            m_titlebar->applyExternal(color);
+    const QColor c = parseCssColor(cssColor);
+    if (!c.isValid())
         return;
-    }
-    const QImage image = grab.toImage();
-    quint64 r = 0, g = 0, b = 0;
-    int n = 0;
-    for (int y = 0; y < image.height(); ++y) {
-        for (int x = 0; x < image.width(); ++x) {
-            const QRgb p = image.pixel(x, y);
-            r += qRed(p);
-            g += qGreen(p);
-            b += qBlue(p);
-            ++n;
-        }
-    }
-    if (n == 0)
-        return;
-    const QColor sampled(int(r / n), int(g / n), int(b / n));
-    qWarning().noquote() << "[kslack/chrome] css=" << cssColor
-                          << "painted=" << sampled.name();
-    m_titlebar->applyExternal(sampled);
+    qWarning().noquote() << "[kslack/chrome]" << cssColor << "->" << c.name();
+    m_titlebar->applyExternal(c);
+    setCachedColorFor(m_currentTeamId, c);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
