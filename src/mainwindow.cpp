@@ -39,11 +39,10 @@
 
 static const QString userAgent = QStringLiteral(
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Slack/4.47.69 Chrome/120.0.6099.291 "
-    "Electron/28.3.3 Safari/537.36");
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36");
 
-static const QString slackUrl = QStringLiteral("https://app.slack.com/ssb/first");
-static const QString slackSignInUrl = QStringLiteral("https://app.slack.com/ssb/signin");
+static const QString slackUrl = QStringLiteral("https://app.slack.com/");
+static const QString slackSignInUrl = QStringLiteral("https://slack.com/signin");
 
 static bool isSlackHost(const QString &host)
 {
@@ -113,6 +112,10 @@ MainWindow::MainWindow(QWidget *parent)
 {
     auto *profile = new QWebEngineProfile(QStringLiteral("kslack"), this);
     profile->setHttpUserAgent(userAgent);
+    // Slack sets the d-s session cookie with no expiry, so a normal browser
+    // drops it on shutdown and you have to re-auth on every cold start.
+    // ForcePersistentCookies keeps session cookies on disk too.
+    profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
     profile->setNotificationPresenter([this](std::unique_ptr<QWebEngineNotification> n) {
         handleNotification(std::move(n));
     });
@@ -178,14 +181,11 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_view, &QWebEngineView::titleChanged,
             this, &MainWindow::updateBadgeFromTitle);
 
-    // /ssb/redirect is Slack's desktop sign-in completion page. In the real
-    // Slack desktop app, Electron's preload catches it and IPCs the main
-    // process to navigate to the workspace. Since we're not Electron, the
-    // page hangs there — jump to /client/ ourselves once cookies are set.
+    // /ssb/redirect is a "tell desktop to load workspace" page that hangs
+    // without Electron IPC. Jump to /client/ ourselves — with plain Chrome
+    // UA Slack's web client renders normally there.
     connect(m_view, &QWebEngineView::urlChanged, this, [this](const QUrl &url) {
-        if (!isSlackHost(url.host()))
-            return;
-        if (url.path().endsWith(QStringLiteral("/ssb/redirect"))) {
+        if (isSlackHost(url.host()) && url.path().endsWith(QStringLiteral("/ssb/redirect"))) {
             QTimer::singleShot(400, m_view, [this]() {
                 m_view->load(QUrl(QStringLiteral("https://app.slack.com/client/")));
             });

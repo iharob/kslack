@@ -1,5 +1,6 @@
 #include "titlebarcolor.h"
 
+#include <QDebug>
 #include <QDir>
 #include <QImage>
 #include <QModelIndex>
@@ -107,14 +108,19 @@ void TitlebarColorWatcher::start()
 
 void TitlebarColorWatcher::sample()
 {
-    if (!m_ready || !m_view || m_view->size().isEmpty())
+    if (!m_ready || !m_view || m_view->size().isEmpty()) {
+        qWarning() << "[kslack/titlebar] sample skipped — not ready or no size";
         return;
+    }
 
     const QPixmap pixmap = m_view->grab();
-    if (pixmap.isNull())
+    if (pixmap.isNull()) {
+        qWarning() << "[kslack/titlebar] grab() returned null pixmap";
         return;
+    }
 
     const QImage image = pixmap.toImage();
+    qWarning() << "[kslack/titlebar] grabbed" << image.width() << "x" << image.height();
     if (image.height() < 1 || image.width() < 8)
         return;
 
@@ -147,8 +153,15 @@ void TitlebarColorWatcher::apply(const QColor &background)
 
     auto *mgr = KColorSchemeManager::instance();
     const auto idx = mgr->indexForScheme(QString::fromLatin1(kSchemeName));
-    if (idx.isValid())
+    qWarning().noquote() << "[kslack/titlebar] apply" << background.name()
+                          << "fg=" << fg.name()
+                          << "schemeIndex.isValid=" << idx.isValid();
+    if (idx.isValid()) {
+        // KWin treats activate-same-scheme-twice as a no-op for the decoration,
+        // so flip through the default scheme first to force a re-read.
+        mgr->activateScheme(QModelIndex());
         mgr->activateScheme(idx);
+    }
 
     m_lastApplied = background;
 }
