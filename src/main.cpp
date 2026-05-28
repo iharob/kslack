@@ -12,8 +12,6 @@ int main(int argc, char *argv[])
 {
     qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--autoplay-policy=no-user-gesture-required");
     qputenv("QT_FORCE_STDERR_LOGGING", "1");
-    // DevTools-Protocol port for ad-hoc inspection during development.
-    qputenv("QTWEBENGINE_REMOTE_DEBUGGING", "9222");
 
     QApplication app(argc, argv);
 

@@ -264,7 +264,7 @@ MainWindow::MainWindow(QWidget *parent)
         "  }"
         "  function schedule() {"
         "    if (timer) return;"
-        "    timer = setTimeout(report, 150);"
+        "    timer = setTimeout(report, 50);"
         "  }"
         "  schedule();"
         "  var mo = new MutationObserver(schedule);"
@@ -523,10 +523,42 @@ static QColor parseCssColor(const QString &css)
 
 void MainWindow::applyChromeColor(const QString &cssColor)
 {
-    const QColor color = parseCssColor(cssColor);
-    if (!color.isValid() || !m_titlebar)
+    // The CSS variable is a useful "something changed" signal but not the
+    // colour that's actually painted (Slack composites a semi-transparent
+    // workspace-rail over p-theme_background). Use the variable change to
+    // *trigger* a literal pixel read of the top-left painted area so the
+    // titlebar matches what the user actually sees.
+    if (!m_titlebar)
         return;
-    m_titlebar->applyExternal(color);
+
+    QPixmap grab = m_view->grab(QRect(0, 0, qMin(64, m_view->width()),
+                                      qMin(16, m_view->height())));
+    if (grab.isNull()) {
+        // Fall back to the CSS value if grab() didn't produce anything
+        // (e.g. view not yet realised).
+        const QColor color = parseCssColor(cssColor);
+        if (color.isValid())
+            m_titlebar->applyExternal(color);
+        return;
+    }
+    const QImage image = grab.toImage();
+    quint64 r = 0, g = 0, b = 0;
+    int n = 0;
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            const QRgb p = image.pixel(x, y);
+            r += qRed(p);
+            g += qGreen(p);
+            b += qBlue(p);
+            ++n;
+        }
+    }
+    if (n == 0)
+        return;
+    const QColor sampled(int(r / n), int(g / n), int(b / n));
+    qWarning().noquote() << "[kslack/chrome] css=" << cssColor
+                          << "painted=" << sampled.name();
+    m_titlebar->applyExternal(sampled);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
