@@ -31,6 +31,8 @@
 #include <QWebEnginePage>
 #include <QWebEnginePermission>
 #include <QWebEngineProfile>
+#include <QWebEngineUrlRequestInfo>
+#include <QWebEngineUrlRequestInterceptor>
 #include <QWebEngineScript>
 #include <QWebEngineScriptCollection>
 #include <QWebEngineSettings>
@@ -173,15 +175,25 @@ static bool isAuthProviderHost(const QString &host)
         || host.endsWith(QStringLiteral(".duosecurity.com"));
 }
 
-// Which UA to present for a navigation to `host`. Identity providers get the
-// Firefox UA so embedded-Chromium OAuth checks (Google's especially) pass;
-// everything else — Slack and the rest — gets the desktop UA so Slack stays in
-// desktop mode. The profile UA is global, so callers set it just before the
-// navigation that needs it.
-static QString userAgentForHost(const QString &host)
+// Per-host User-Agent, applied at the network layer for every request. The
+// profile UA stays the desktop (SSB) UA the whole session; we only override the
+// outgoing User-Agent *header* on identity-provider hosts, so their embedded-
+// browser OAuth checks (Google's especially) pass. This replaces the previous
+// scheme of swapping the global profile UA inside acceptNavigationRequest, which
+// re-entered QtWebEngine and crashed (SIGTRAP) on any main-frame navigation that
+// needed a swap. An interceptor never mutates the profile and never alters the
+// request method, so it crashes nothing and leaves OAuth/SAML POSTs intact.
+class UAInterceptor : public QWebEngineUrlRequestInterceptor
 {
-    return isAuthProviderHost(host) ? authUserAgent : desktopUserAgent;
-}
+public:
+    using QWebEngineUrlRequestInterceptor::QWebEngineUrlRequestInterceptor;
+
+    void interceptRequest(QWebEngineUrlRequestInfo &info) override
+    {
+        if (isAuthProviderHost(info.requestUrl().host()))
+            info.setHttpHeader(QByteArrayLiteral("User-Agent"), authUserAgent.toUtf8());
+    }
+};
 
 static void openInBrowser(const QUrl &url)
 {
@@ -225,14 +237,9 @@ protected:
             return false;
         }
 
-        // Present the right UA for the host we're about to load: Firefox on IdP
-        // sign-in hosts (so embedded-Chromium OAuth checks pass), the desktop UA
-        // on Slack and everything else (so Slack stays in desktop mode). The
-        // profile UA is global, so set it here, just before the request goes out.
-        const QString ua = userAgentForHost(url.host());
-        if (profile()->httpUserAgent() != ua)
-            profile()->setHttpUserAgent(ua);
-
+        // The per-host User-Agent is applied by UAInterceptor at the network
+        // layer — never by mutating the profile UA here, which re-enters
+        // QtWebEngine and crashes (SIGTRAP) on any navigation that needs a swap.
         return true;
     }
 
@@ -259,6 +266,20 @@ protected:
                                  << message.mid(17);
             return;
         }
+        // Tray badge: Slack's window.desktop.dock.setBadgeCount(n) is forwarded
+        // here as "mention" (n > 0) or "none". See the desktopBridge script.
+        if (message.startsWith(QStringLiteral("__kslack_badge__:"))) {
+            QMetaObject::invokeMethod(m_owner, "updateBadge",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, message.mid(17)));
+            return;
+        }
+        // KSLACK_BRIDGE_DEBUG diagnostic: every swallowed window.desktop call and
+        // the web Notification probes, for re-discovering the bridge surface.
+        if (message.startsWith(QStringLiteral("__kslack_probe__:"))) {
+            qWarning().noquote() << "[kslack/probe]" << message.mid(17);
+            return;
+        }
         QWebEnginePage::javaScriptConsoleMessage(level, message, lineNumber, sourceID);
     }
 
@@ -274,6 +295,7 @@ MainWindow::MainWindow(QWidget *parent)
     // client. acceptNavigationRequest swaps to the Firefox UA for IdP hosts
     // during sign-in and back again (see userAgentForHost).
     profile->setHttpUserAgent(desktopUserAgent);
+    profile->setUrlRequestInterceptor(new UAInterceptor(this));
     profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
 
     // ForcePersistentCookies keeps the on-disk file but Chromium still marks
@@ -304,6 +326,24 @@ MainWindow::MainWindow(QWidget *parent)
     profile->setNotificationPresenter([this](std::unique_ptr<QWebEngineNotification> n) {
         handleNotification(std::move(n));
     });
+    // Pre-grant the Notifications permission for the Slack client origin. In SSB
+    // desktop mode Slack assumes the host app already holds notification
+    // permission (the real Electron app does) and creates notifications via the
+    // web Notification API without first calling Notification.requestPermission().
+    // QtWebEngine then leaves the permission in the default ("ask") state and
+    // never invokes our presenter, so notifications silently never appear.
+    // Granting it up front (persisted on disk) makes Notification.permission read
+    // "granted", so new Notification(...) flows to handleNotification(). The
+    // request-time handler (handlePermission) still covers any explicit prompt.
+    profile->setPersistentPermissionsPolicy(
+        QWebEngineProfile::PersistentPermissionsPolicy::StoreOnDisk);
+    for (const auto &origin : { "https://app.slack.com", "https://slack.com" }) {
+        auto permission = profile->queryPermission(
+            QUrl::fromUserInput(QString::fromLatin1(origin)),
+            QWebEnginePermission::PermissionType::Notifications);
+        if (permission.isValid())
+            permission.grant();
+    }
     profile->settings()->setAttribute(QWebEngineSettings::PlaybackRequiresUserGesture, false);
 
     m_view = new QWebEngineView(this);
@@ -335,11 +375,19 @@ MainWindow::MainWindow(QWidget *parent)
     // get + logs), so we only need to satisfy redux.getState plus the
     // windowToken source (window.browserWindowId). Inject at DocumentCreation
     // in the main world so it's in place before Slack's bundle evaluates.
+    // Set KSLACK_BRIDGE_DEBUG=1 to turn the bridge into a diagnostic: every
+    // window.desktop.* call Slack makes (other than the ones we implement) is
+    // logged through the console marker channel as [kslack/probe]. This is the
+    // supported way to re-discover the bridge surface when a Slack update moves
+    // things — see project_desktop_spoof memory.
+    const bool bridgeDebug = qEnvironmentVariableIsSet("KSLACK_BRIDGE_DEBUG");
+
     QWebEngineScript desktopBridge;
     desktopBridge.setSourceCode(QStringLiteral(
         "(function() {"
         "  if (window.__kslackDesktop) return;"
         "  window.__kslackDesktop = true;"
+        "  var KSLACK_DEBUG = ") + QLatin1String(bridgeDebug ? "true" : "false") + QStringLiteral(";"
         "  if (!window.browserWindowId) window.browserWindowId = 1;"
         "  var STATE = {"
         "    environment: {"
@@ -361,27 +409,123 @@ MainWindow::MainWindow(QWidget *parent)
         "    return node;"
         "  }"
         "  function noop() {}"
+        // Tray badge: Slack drives the desktop badge through
+        // bindDesktopMethod(['dock','setBadgeCount']) → window.desktop.dock
+        // .setBadgeCount(n), where n is the unread-highlight (mention) count
+        // Slack itself would show as the dock badge (it follows the user's
+        // "badge for: all activity / mentions only" setting). We forward the
+        // on/off state to the C++ side, which lights the tray dot. A real nested
+        // object is required (not the Proxy fallback) because bindDesktopMethod
+        // resolves the method with lodash.get(window,'desktop.dock.setBadgeCount')
+        // and a missing leaf is silently dropped.
+        "  function reportBadge(count) {"
+        "    var on = (typeof count === 'number') ? count > 0 : !!count;"
+        "    if (KSLACK_DEBUG) { try { console.log('__kslack_probe__:dock.setBadgeCount|' + JSON.stringify([count])); } catch (e) {} }"
+        "    try { console.log('__kslack_badge__:' + (on ? 'mention' : 'none')); } catch (e) {}"
+        "  }"
+        // Diagnostic only (KSLACK_BRIDGE_DEBUG): a recursive, callable Proxy that
+        // logs every access/call path without ever throwing, so Slack's boot
+        // side-effects survive. makeProbe('desktop.foo') logs desktop.foo(args),
+        // and chains: desktop.foo.bar() logs that full path.
+        "  function probeLog(path, args) {"
+        "    var a;"
+        "    try { a = JSON.stringify(Array.prototype.slice.call(args)); }"
+        "    catch (e) { a = '<unstringifiable>'; }"
+        "    try { console.log('__kslack_probe__:' + path + '|' + a); } catch (e) {}"
+        "  }"
+        "  function makeProbe(path) {"
+        "    var fn = function() { probeLog(path, arguments); return undefined; };"
+        "    return new Proxy(fn, {"
+        "      get: function(t, prop) {"
+        "        if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "        if (prop in t) return t[prop];"
+        "        return makeProbe(path + '.' + String(prop));"
+        "      },"
+        "      apply: function(t, thiz, args) { probeLog(path, args); return undefined; }"
+        "    });"
+        "  }"
+        // desktop.dock namespace: implement setBadgeCount, keep every other
+        // dock.* access a no-op (or probe) so we never throw, mirroring the
+        // top-level bridge's crash-tolerance.
+        "  function makeDock() {"
+        "    var impl = { setBadgeCount: function(count) { reportBadge(count); } };"
+        "    return new Proxy(function() {}, {"
+        "      get: function(t, prop) {"
+        "        if (prop in impl) return impl[prop];"
+        "        if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "        if (prop in t) return t[prop];"
+        "        return KSLACK_DEBUG ? makeProbe('desktop.dock.' + String(prop)) : noop;"
+        "      }"
+        "    });"
+        "  }"
+        // desktop.notice namespace. Notifications themselves use the web
+        // Notification API (which our setNotificationPresenter handles), but
+        // before showing one Slack calls desktop.notice.getNotificationWarnings()
+        // and *awaits the result* (getParsedNotificationWarnings → .then). A bare
+        // no-op returns undefined, so `.then` throws and the whole messageReceived
+        // handler aborts — no notification. Return a resolved empty warning list so
+        // the flow proceeds. (We intentionally leave app.canShowHtmlNotifications
+        // falsy so Slack uses the web Notification API rather than a custom HTML
+        // notification window we can't host.)
+        "  function makeNotice() {"
+        "    var impl = { getNotificationWarnings: function() { return Promise.resolve([]); } };"
+        "    return new Proxy(function() {}, {"
+        "      get: function(t, prop) {"
+        "        if (prop in impl) return impl[prop];"
+        "        if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "        if (prop in t) return t[prop];"
+        "        return KSLACK_DEBUG ? makeProbe('desktop.notice.' + String(prop)) : noop;"
+        "      }"
+        "    });"
+        "  }"
         "  var real = {"
         "    redux: {"
         "      getState: getState,"
         "      dispatchUpdate: noop,"
         "      subscribe: function() { return noop; }"
-        "    }"
+        "    },"
+        "    dock: makeDock(),"
+        "    notice: makeNotice()"
         "  };"
         // Some desktop methods are called DIRECTLY (window.desktop.foo()),
         // bypassing the null-safe bindDesktopMethod — a missing one throws and
         // aborts its boot side-effect (we hit exposeWorkspaceDelegate, then
         // setGlobalDelegate, …). Rather than chase each, wrap in a Proxy: known
         // keys resolve to the real bridge, every other property is a callable
-        // no-op. 'then' returns undefined so the object isn't mistaken for a
-        // thenable when awaited.
+        // no-op (or, with KSLACK_DEBUG, a logging probe). 'then' returns undefined
+        // so the object isn't mistaken for a thenable when awaited.
         "  window.desktop = new Proxy(real, {"
         "    get: function(target, prop) {"
         "      if (prop in target) return target[prop];"
         "      if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "      if (KSLACK_DEBUG) return makeProbe('desktop.' + String(prop));"
         "      return noop;"
         "    }"
         "  });"
+        // Notifications go through the standard web Notification API
+        // (new Notification(title,{body,icon,tag})), which QtWebEngine routes to
+        // our setNotificationPresenter — no bridge shim needed. Under
+        // KSLACK_BRIDGE_DEBUG, log construction + permission requests so the
+        // notification path stays observable if a Slack update changes it.
+        "  if (KSLACK_DEBUG && window.Notification) {"
+        "    try {"
+        "      window.Notification = new Proxy(window.Notification, {"
+        "        construct: function(t, args) {"
+        "          try { console.log('__kslack_probe__:Notification.new|' + JSON.stringify(args)); } catch (e) {}"
+        "          return new (Function.prototype.bind.apply(t, [null].concat(args)))();"
+        "        },"
+        "        get: function(t, prop) {"
+        "          if (prop === 'requestPermission') {"
+        "            return function() {"
+        "              try { console.log('__kslack_probe__:Notification.requestPermission|[]'); } catch (e) {}"
+        "              return t.requestPermission.apply(t, arguments);"
+        "            };"
+        "          }"
+        "          return t[prop];"
+        "        }"
+        "      });"
+        "    } catch (e) {}"
+        "  }"
         "})();"
     ));
     desktopBridge.setInjectionPoint(QWebEngineScript::DocumentCreation);
@@ -480,11 +624,11 @@ MainWindow::MainWindow(QWidget *parent)
                 // cookie jar as our main view.
                 auto *profile = m_view->page()->profile();
                 // This popup only ever opens on an IdP (Slack URLs took the
-                // branch above), and it's a plain page that doesn't run our
-                // acceptNavigationRequest UA swap — so pin the Firefox UA here
-                // for the sign-in round trip. finish() returns to Slack via the
-                // main view, which restores the desktop UA.
-                profile->setHttpUserAgent(authUserAgent);
+                // branch above). It shares our profile; UAInterceptor already
+                // serves the Firefox UA to identity-provider hosts at the network
+                // layer, so no global profile-UA change is needed here (and the
+                // profile UA must stay the desktop UA so the main view keeps Slack
+                // in SSB mode).
                 auto *popup = new QWebEngineView(profile);
                 popup->setAttribute(Qt::WA_DeleteOnClose);
                 popup->resize(560, 720);
@@ -535,9 +679,6 @@ MainWindow::MainWindow(QWidget *parent)
                         });
                 popup->show();
             });
-
-    connect(m_view, &QWebEngineView::titleChanged,
-            this, &MainWindow::updateBadgeFromTitle);
 
     m_titlebar = new TitlebarColorWatcher(m_view, this);
     m_titlebar->start();
@@ -731,18 +872,14 @@ void MainWindow::handleNotification(std::unique_ptr<QWebEngineNotification> webN
     knotify->sendEvent();
 }
 
-void MainWindow::updateBadgeFromTitle(const QString &title)
+void MainWindow::updateBadge(const QString &state)
 {
-    BadgeState state = BadgeState::None;
-    const QString trimmed = title.trimmed();
-    if (trimmed.startsWith(QLatin1Char('('))) {
-        state = BadgeState::Mention;
-    } else if (trimmed.startsWith(QLatin1Char('*'))
-               || trimmed.contains(QStringLiteral("• "))
-               || trimmed.contains(QStringLiteral(" * "))) {
-        state = BadgeState::Unread;
-    }
-    applyBadge(state);
+    // Driven by window.desktop.dock.setBadgeCount via the bridge (see the
+    // desktopBridge script). Modern Slack only reports the unread-highlight
+    // (mention) count to the desktop badge, so the tray dot is mention-only.
+    applyBadge(state == QStringLiteral("mention")
+                   ? BadgeState::Mention
+                   : BadgeState::None);
 }
 
 void MainWindow::applyBadge(BadgeState state)

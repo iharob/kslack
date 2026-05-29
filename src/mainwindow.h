@@ -21,6 +21,7 @@ public:
 
 public Q_SLOTS:
     void applyChromeColor(const QString &cssColor);
+    void updateBadge(const QString &state);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -35,7 +36,6 @@ private:
     void setAutostartEnabled(bool enabled);
     void handlePermission(QWebEnginePermission permission);
     void handleNotification(std::unique_ptr<QWebEngineNotification> notification);
-    void updateBadgeFromTitle(const QString &title);
     void applyBadge(BadgeState state);
 
     QWebEngineView *m_view = nullptr;
