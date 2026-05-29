@@ -48,7 +48,8 @@ int main(int argc, char *argv[])
     KDBusService service(KDBusService::Unique);
 
     auto *window = new MainWindow;
-    window->show();
+    if (!QCoreApplication::arguments().contains(QStringLiteral("--hidden")))
+        window->show();
 
     QObject::connect(&service, &KDBusService::activateRequested, window, [window]() {
         window->show();

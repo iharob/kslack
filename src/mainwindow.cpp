@@ -13,6 +13,7 @@
 #include <QIcon>
 #include <QMenu>
 #include <QMenuBar>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QWebEngineNewWindowRequest>
@@ -815,16 +816,16 @@ void MainWindow::setAutostartEnabled(bool enabled)
 
     QDir().mkpath(QFileInfo(path).absolutePath());
 
+    QString contents;
     const QString installed = QStandardPaths::locate(
         QStandardPaths::ApplicationsLocation, QStringLiteral("org.kde.kslack.desktop"));
     if (!installed.isEmpty()) {
-        QFile::copy(installed, path);
-        return;
+        QFile in(installed);
+        if (in.open(QIODevice::ReadOnly | QIODevice::Text))
+            contents = QString::fromUtf8(in.readAll());
     }
-
-    QFile file(path);
-    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        file.write(
+    if (contents.isEmpty()) {
+        contents = QStringLiteral(
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=KSlack\n"
@@ -833,6 +834,18 @@ void MainWindow::setAutostartEnabled(bool enabled)
             "Terminal=false\n"
             "X-GNOME-Autostart-enabled=true\n");
     }
+
+    // Autostart launches go straight to the tray.
+    static const QRegularExpression execLine(
+        QStringLiteral("^(Exec=.*)$"), QRegularExpression::MultilineOption);
+    const auto m = execLine.match(contents);
+    if (m.hasMatch() && !m.captured(1).contains(QStringLiteral("--hidden")))
+        contents.replace(m.capturedStart(1), m.capturedLength(1),
+                         m.captured(1) + QStringLiteral(" --hidden"));
+
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text))
+        file.write(contents.toUtf8());
 }
 
 void MainWindow::handlePermission(QWebEnginePermission permission)
