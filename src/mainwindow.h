@@ -35,6 +35,8 @@ private:
 
     void setupActions();
     void setupTrayIcon();
+    bool isAutostartEnabled() const;
+    void setAutostartEnabled(bool enabled);
     void handlePermission(QWebEnginePermission permission);
     void handleNotification(std::unique_ptr<QWebEngineNotification> notification);
     void updateBadgeFromTitle(const QString &title);

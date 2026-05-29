@@ -9,8 +9,11 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QIcon>
+#include <QMenu>
 #include <QMenuBar>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QWebEngineNewWindowRequest>
 #include <QMessageBox>
@@ -477,6 +480,18 @@ void MainWindow::setupTrayIcon()
     else
         m_trayIcon->setIconByName(QStringLiteral("kslack"));
     m_trayIcon->setStandardActionsEnabled(true);
+
+    auto *signInAct = new QAction(QIcon::fromTheme(QStringLiteral("system-users")),
+                                  i18n("Sign In via Browser..."), this);
+    connect(signInAct, &QAction::triggered, this, &MainWindow::signIn);
+    m_trayIcon->contextMenu()->addAction(signInAct);
+
+    auto *autostart = new QAction(i18n("Start automatically at login"), this);
+    autostart->setCheckable(true);
+    autostart->setChecked(isAutostartEnabled());
+    connect(autostart, &QAction::toggled, this, &MainWindow::setAutostartEnabled);
+    m_trayIcon->contextMenu()->addAction(autostart);
+
     m_trayIcon->setToolTipTitle(i18n("KSlack"));
     m_trayIcon->setToolTipSubTitle(i18n("Slack Client"));
 
@@ -489,6 +504,46 @@ void MainWindow::setupTrayIcon()
             activateWindow();
         }
     });
+}
+
+static QString autostartDesktopPath()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+        + QStringLiteral("/autostart/org.kde.kslack.desktop");
+}
+
+bool MainWindow::isAutostartEnabled() const
+{
+    return QFile::exists(autostartDesktopPath());
+}
+
+void MainWindow::setAutostartEnabled(bool enabled)
+{
+    const QString path = autostartDesktopPath();
+    QFile::remove(path);
+    if (!enabled)
+        return;
+
+    QDir().mkpath(QFileInfo(path).absolutePath());
+
+    const QString installed = QStandardPaths::locate(
+        QStandardPaths::ApplicationsLocation, QStringLiteral("org.kde.kslack.desktop"));
+    if (!installed.isEmpty()) {
+        QFile::copy(installed, path);
+        return;
+    }
+
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        file.write(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=KSlack\n"
+            "Exec=kslack\n"
+            "Icon=kslack\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n");
+    }
 }
 
 void MainWindow::handlePermission(QWebEnginePermission permission)

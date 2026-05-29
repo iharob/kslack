@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  build:
+    name: Arch Linux / KF6
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            git \
+            cmake \
+            extra-cmake-modules \
+            qt6-base \
+            qt6-webengine \
+            kcoreaddons \
+            ki18n \
+            kxmlgui \
+            kcrash \
+            kdbusaddons \
+            knotifications \
+            kstatusnotifieritem \
+            kconfig
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
