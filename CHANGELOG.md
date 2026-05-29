@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/iharob/kslack/compare/v1.4.0...v1.5.0) (2026-05-29)
+
+
+### Features
+
+* light a tray badge for mentions and make desktop notifications work ([7ac8899](https://github.com/iharob/kslack/commit/7ac88999c093702e34061970de5fb9cd85dbb1af))
+
 ## [1.4.0](https://github.com/iharob/kslack/compare/v1.3.0...v1.4.0) (2026-05-29)
 
 
