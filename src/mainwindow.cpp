@@ -45,18 +45,42 @@
 #include <KStandardAction>
 #include <KStatusNotifierItem>
 
-// Spoof Firefox, NOT Chrome. Google blocks Google-account sign-in (adding a
-// workspace via "Continue with Google") from embedded browsers with "this
-// browser or app may not be secure". A Chrome UA does not help — because this
-// is Chromium under the hood, QtWebEngine emits Sec-CH-UA client hints that
-// Google cross-checks against the UA; the embedded-Chromium signature does not
-// match a real Chrome and the check fails. Firefox is a Gecko browser that
-// sends no Sec-CH-UA, so the UA stands alone with nothing to contradict it and
-// the sign-in goes through. This is the same fix qutebrowser (also QtWebEngine)
-// ships as a default site quirk. Slack's web app fully supports Firefox.
-static const QString userAgent = QStringLiteral(
+// We present TWO user agents and swap per navigation host (see
+// userAgentForHost): the Slack desktop UA on Slack and most hosts, the Firefox
+// UA on identity-provider hosts during sign-in. Each solves a problem the other
+// would re-create, so neither can be used alone.
+//
+// authUserAgent — Firefox/Gecko. Google blocks Google-account sign-in ("Continue
+// with Google") from embedded browsers with "this browser or app may not be
+// secure". A Chrome UA does not help: we are Chromium under the hood, so
+// QtWebEngine emits Sec-CH-UA client hints that Google cross-checks against the
+// UA; the embedded-Chromium signature does not match real Chrome and the check
+// fails. Firefox is Gecko, sends no Sec-CH-UA, so the UA stands alone and
+// sign-in goes through. Same fix qutebrowser (also QtWebEngine) ships as a
+// quirk. We scope it to auth-provider hosts so it only covers the OAuth round
+// trip — using it everywhere would put Slack back into plain browser mode.
+static const QString authUserAgent = QStringLiteral(
     "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) "
     "Gecko/20100101 Firefox/140.0");
+
+// desktopUserAgent — impersonate the Slack Electron desktop app (SSB). The
+// Slack/Electron/Slack_SSB tokens are what app.slack.com sniffs to render its
+// desktop client (isDesktop() === true) instead of the browser experience. Once
+// in desktop mode Slack reaches for an Electron IPC bridge; we satisfy the parts
+// it hard-depends on with an injected window.desktop stub (see the bridge script
+// in the constructor), without which /client fails to mount.
+//
+// The version matters: Slack ships a support matrix in its bundle with a current
+// minimum (slack 4.41.0) and an upcoming `next` minimum (slack 4.44.00). A
+// version below `next` triggers the "this version is no longer compatible"
+// deprecation banner, so we report comfortably above it. The embedded Chrome
+// token (138) is already above Slack's `next` chrome min (137). The Linux distro
+// deprecation only fires when the UA carries an Ubuntu/Red Hat token, which ours
+// deliberately does not.
+static const QString desktopUserAgent = QStringLiteral(
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Slack/4.45.0 Chrome/138.0.7204.97 Electron/37.2.3 Safari/537.36 "
+    "Slack_SSB/4.45.0");
 
 static const QString slackUrl = QStringLiteral("https://app.slack.com/");
 
@@ -149,6 +173,16 @@ static bool isAuthProviderHost(const QString &host)
         || host.endsWith(QStringLiteral(".duosecurity.com"));
 }
 
+// Which UA to present for a navigation to `host`. Identity providers get the
+// Firefox UA so embedded-Chromium OAuth checks (Google's especially) pass;
+// everything else — Slack and the rest — gets the desktop UA so Slack stays in
+// desktop mode. The profile UA is global, so callers set it just before the
+// navigation that needs it.
+static QString userAgentForHost(const QString &host)
+{
+    return isAuthProviderHost(host) ? authUserAgent : desktopUserAgent;
+}
+
 static void openInBrowser(const QUrl &url)
 {
     // QDesktopServices::openUrl() goes through QtDBus / xdg-desktop-portal
@@ -191,6 +225,14 @@ protected:
             return false;
         }
 
+        // Present the right UA for the host we're about to load: Firefox on IdP
+        // sign-in hosts (so embedded-Chromium OAuth checks pass), the desktop UA
+        // on Slack and everything else (so Slack stays in desktop mode). The
+        // profile UA is global, so set it here, just before the request goes out.
+        const QString ua = userAgentForHost(url.host());
+        if (profile()->httpUserAgent() != ua)
+            profile()->setHttpUserAgent(ua);
+
         return true;
     }
 
@@ -228,7 +270,10 @@ MainWindow::MainWindow(QWidget *parent)
     : KXmlGuiWindow(parent)
 {
     auto *profile = new QWebEngineProfile(QStringLiteral("kslack"), this);
-    profile->setHttpUserAgent(userAgent);
+    // Start on the desktop UA so the first Slack load renders the desktop
+    // client. acceptNavigationRequest swaps to the Firefox UA for IdP hosts
+    // during sign-in and back again (see userAgentForHost).
+    profile->setHttpUserAgent(desktopUserAgent);
     profile->setPersistentCookiesPolicy(QWebEngineProfile::ForcePersistentCookies);
 
     // ForcePersistentCookies keeps the on-disk file but Chromium still marks
@@ -279,6 +324,70 @@ MainWindow::MainWindow(QWidget *parent)
     script.setWorldId(QWebEngineScript::ApplicationWorld);
     script.setRunsOnSubFrames(false);
     m_view->page()->scripts().insert(script);
+
+    // Desktop interop bridge stub. With the Slack_SSB UA, Slack's
+    // client renders in desktop mode and calls getDesktopState() — which is
+    // bindDesktopMethod(["redux","getState"]) → lodash.get(window,
+    // "desktop.redux.getState")(...path). Without an Electron preload this is
+    // undefined, the Client component destructures the undefined return
+    // (`const { darwin } = getDesktopState("environment")`) and the whole UI
+    // fails to mount. bindDesktopMethod tolerates *missing* methods (null-safe
+    // get + logs), so we only need to satisfy redux.getState plus the
+    // windowToken source (window.browserWindowId). Inject at DocumentCreation
+    // in the main world so it's in place before Slack's bundle evaluates.
+    QWebEngineScript desktopBridge;
+    desktopBridge.setSourceCode(QStringLiteral(
+        "(function() {"
+        "  if (window.__kslackDesktop) return;"
+        "  window.__kslackDesktop = true;"
+        "  if (!window.browserWindowId) window.browserWindowId = 1;"
+        "  var STATE = {"
+        "    environment: {"
+        "      platform: 'linux', arch: 'x64', platformVersion: '6.0.0',"
+        "      appVersion: '4.45.0', version: '4.45.0', releaseChannel: 'prod',"
+        "      uuid: 'kslack-0000-0000-0000-000000000001',"
+        "      sessionId: 'kslack-0000-0000-0000-000000000002',"
+        "      isGpuCompositionAvailable: false, isStore: false"
+        "    },"
+        "    settings: { zoomLevel: 0, useHwAcceleration: true, releaseChannelOverride: null },"
+        "    app: { hwAccelAvailability: 'unavailable' }"
+        "  };"
+        "  function getState() {"
+        "    var node = STATE;"
+        "    for (var i = 0; i < arguments.length; i++) {"
+        "      if (node == null) return undefined;"
+        "      node = node[arguments[i]];"
+        "    }"
+        "    return node;"
+        "  }"
+        "  function noop() {}"
+        "  var real = {"
+        "    redux: {"
+        "      getState: getState,"
+        "      dispatchUpdate: noop,"
+        "      subscribe: function() { return noop; }"
+        "    }"
+        "  };"
+        // Some desktop methods are called DIRECTLY (window.desktop.foo()),
+        // bypassing the null-safe bindDesktopMethod — a missing one throws and
+        // aborts its boot side-effect (we hit exposeWorkspaceDelegate, then
+        // setGlobalDelegate, …). Rather than chase each, wrap in a Proxy: known
+        // keys resolve to the real bridge, every other property is a callable
+        // no-op. 'then' returns undefined so the object isn't mistaken for a
+        // thenable when awaited.
+        "  window.desktop = new Proxy(real, {"
+        "    get: function(target, prop) {"
+        "      if (prop in target) return target[prop];"
+        "      if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "      return noop;"
+        "    }"
+        "  });"
+        "})();"
+    ));
+    desktopBridge.setInjectionPoint(QWebEngineScript::DocumentCreation);
+    desktopBridge.setWorldId(QWebEngineScript::MainWorld);
+    desktopBridge.setRunsOnSubFrames(true);
+    m_view->page()->scripts().insert(desktopBridge);
 
     // Chrome-colour observer: read the *unfiltered* background-color of the
     // .p-theme_background element. In IA4 Slack, every layer above it is
@@ -370,6 +479,12 @@ MainWindow::MainWindow(QWidget *parent)
                 // OAuth callback at oauth2.slack.com lands in the same
                 // cookie jar as our main view.
                 auto *profile = m_view->page()->profile();
+                // This popup only ever opens on an IdP (Slack URLs took the
+                // branch above), and it's a plain page that doesn't run our
+                // acceptNavigationRequest UA swap — so pin the Firefox UA here
+                // for the sign-in round trip. finish() returns to Slack via the
+                // main view, which restores the desktop UA.
+                profile->setHttpUserAgent(authUserAgent);
                 auto *popup = new QWebEngineView(profile);
                 popup->setAttribute(Qt::WA_DeleteOnClose);
                 popup->resize(560, 720);
@@ -447,9 +562,10 @@ MainWindow::MainWindow(QWidget *parent)
         m_lastChromeCss.clear();
     });
 
-    // /ssb/redirect is a "tell desktop to load workspace" page that hangs
-    // without Electron IPC. Jump to /client/ ourselves — with plain Chrome
-    // UA Slack's web client renders normally there.
+    // /ssb/redirect is a "tell desktop to load workspace" page that, in the real
+    // app, the Electron main process handles over IPC. Our window.desktop stub
+    // doesn't drive that handoff, so jump to /client/ ourselves — it renders
+    // normally there under our desktop UA + bridge.
     connect(m_view, &QWebEngineView::urlChanged, this, [this](const QUrl &url) {
         if (isSlackHost(url.host()) && url.path().endsWith(QStringLiteral("/ssb/redirect"))) {
             QTimer::singleShot(400, m_view, [this]() {
