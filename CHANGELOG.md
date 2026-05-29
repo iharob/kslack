@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/iharob/kslack/compare/v1.3.0...v1.4.0) (2026-05-29)
+
+
+### Features
+
+* render Slack's desktop client by spoofing the SSB app ([3388c69](https://github.com/iharob/kslack/commit/3388c69a466f3fa4eaae2a46bec246ab96cde750))
+
 ## [1.3.0](https://github.com/iharob/kslack/compare/v1.2.0...v1.3.0) (2026-05-29)
 
 
