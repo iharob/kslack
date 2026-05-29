@@ -48,11 +48,13 @@ QColor dimForInactive(const QColor &c)
     return QColor(qRound(c.red() * 0.9), qRound(c.green() * 0.9), qRound(c.blue() * 0.9));
 }
 
+// Writes the *effective* colour into both the active and inactive slots. The
+// focus-driven dim is applied by the caller (render()), not here: KWin 6.x on
+// Wayland renders unfocused windows with the per-window scheme's active colour
+// and never reads its inactive group, so keeping active == inactive guarantees
+// the titlebar shows exactly the colour we computed, whichever slot KWin reads.
 void writeSchemeFile(const QColor &bg, const QColor &fg)
 {
-    const QColor bgInactive = dimForInactive(bg);
-    const QColor fgInactive = dimForInactive(fg);
-
     auto config = KSharedConfig::openConfig(schemeFilePath(), KConfig::SimpleConfig);
 
     KConfigGroup general(config, QStringLiteral("General"));
@@ -65,9 +67,9 @@ void writeSchemeFile(const QColor &bg, const QColor &fg)
     // Blend = background so Breeze doesn't lighten/darken the titlebar with a
     // gradient highlight; we want the exact colour Slack defines.
     wm.writeEntry(QStringLiteral("activeBlend"), rgbTriplet(bg));
-    wm.writeEntry(QStringLiteral("inactiveBackground"), rgbTriplet(bgInactive));
-    wm.writeEntry(QStringLiteral("inactiveForeground"), rgbTriplet(fgInactive));
-    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(bgInactive));
+    wm.writeEntry(QStringLiteral("inactiveBackground"), rgbTriplet(bg));
+    wm.writeEntry(QStringLiteral("inactiveForeground"), rgbTriplet(fg));
+    wm.writeEntry(QStringLiteral("inactiveBlend"), rgbTriplet(bg));
 
     auto writeColorGroup = [&](const QString &parentName) {
         KConfigGroup parent(config, parentName);
@@ -79,10 +81,10 @@ void writeSchemeFile(const QColor &bg, const QColor &fg)
         // string "<parent>][Inactive" makes KConfig escape the brackets and
         // KWin never finds the group.
         KConfigGroup inactive = parent.group(QStringLiteral("Inactive"));
-        inactive.writeEntry(QStringLiteral("BackgroundNormal"), rgbTriplet(bgInactive));
-        inactive.writeEntry(QStringLiteral("BackgroundAlternate"), rgbTriplet(bgInactive));
-        inactive.writeEntry(QStringLiteral("ForegroundNormal"), rgbTriplet(fgInactive));
-        inactive.writeEntry(QStringLiteral("ForegroundInactive"), rgbTriplet(fgInactive));
+        inactive.writeEntry(QStringLiteral("BackgroundNormal"), rgbTriplet(bg));
+        inactive.writeEntry(QStringLiteral("BackgroundAlternate"), rgbTriplet(bg));
+        inactive.writeEntry(QStringLiteral("ForegroundNormal"), rgbTriplet(fg));
+        inactive.writeEntry(QStringLiteral("ForegroundInactive"), rgbTriplet(fg));
     };
     writeColorGroup(QStringLiteral("Colors:Header"));
     writeColorGroup(QStringLiteral("Colors:Window"));
@@ -114,7 +116,8 @@ void TitlebarColorWatcher::start()
     // Write a sensible baseline so KColorSchemeManager can find the scheme on first activate.
     const QColor fallback(0x4A, 0x15, 0x4B);
     writeSchemeFile(fallback, pickForeground(fallback));
-    apply(fallback);
+    m_baseColor = fallback;
+    render();
     // The JS-side observer (mainwindow.cpp) drives all subsequent updates via
     // applyExternal(). The grab-based sampler stays compiled but unused.
 }
@@ -123,9 +126,41 @@ void TitlebarColorWatcher::applyExternal(const QColor &color)
 {
     if (!color.isValid())
         return;
-    if (m_lastApplied.isValid() && close(color, m_lastApplied))
+    // Skip near-identical colours, but only while our scheme is actually the
+    // active one. After a reset() the default scheme is showing, so even an
+    // unchanged colour must be re-applied to bring our tint back.
+    if (m_schemeActive && m_baseColor.isValid() && close(color, m_baseColor))
         return;
-    apply(color);
+    m_baseColor = color;
+    render();
+}
+
+void TitlebarColorWatcher::setWindowActive(bool active)
+{
+    if (active == m_windowActive)
+        return;
+    m_windowActive = active;
+    render();
+}
+
+void TitlebarColorWatcher::render()
+{
+    if (!m_baseColor.isValid())
+        return;
+    apply(m_windowActive ? m_baseColor : dimForInactive(m_baseColor));
+}
+
+void TitlebarColorWatcher::reset()
+{
+    if (!m_schemeActive)
+        return;
+    KColorSchemeManager::instance()->activateScheme(QModelIndex());
+    m_schemeActive = false;
+    // Invalidate so the next applyExternal() always re-activates, regardless of
+    // whether the workspace we return to happens to share the previous colour.
+    m_baseColor = QColor();
+    m_lastApplied = QColor();
+    qWarning().noquote() << "[kslack/titlebar] reset to default scheme";
 }
 
 void TitlebarColorWatcher::sample()
@@ -181,11 +216,16 @@ void TitlebarColorWatcher::apply(const QColor &background)
     qWarning().noquote() << "[kslack/titlebar] apply" << background.name()
                           << "fg=" << fg.name()
                           << "schemeIndex.isValid=" << idx.isValid();
-    if (idx.isValid() && !sameAsLast) {
+    // Re-activate when the colour changed, or when we're coming back from a
+    // reset (default scheme showing) even if the colour is identical.
+    if (idx.isValid() && (!sameAsLast || !m_schemeActive)) {
         // KWin treats activate-same-scheme-twice as a no-op for the decoration,
-        // so flip through the default scheme first to force a re-read.
+        // so flip through the default scheme first to force a re-read. This is
+        // the only path that touches the scheme, so a stable colour never
+        // triggers it — that is what keeps the titlebar from flickering.
         mgr->activateScheme(QModelIndex());
         mgr->activateScheme(idx);
+        m_schemeActive = true;
     }
 
     m_lastApplied = background;

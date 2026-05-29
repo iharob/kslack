@@ -46,9 +46,18 @@
 #include <KStandardAction>
 #include <KStatusNotifierItem>
 
+// Spoof Firefox, NOT Chrome. Google blocks Google-account sign-in (adding a
+// workspace via "Continue with Google") from embedded browsers with "this
+// browser or app may not be secure". A Chrome UA does not help — because this
+// is Chromium under the hood, QtWebEngine emits Sec-CH-UA client hints that
+// Google cross-checks against the UA; the embedded-Chromium signature does not
+// match a real Chrome and the check fails. Firefox is a Gecko browser that
+// sends no Sec-CH-UA, so the UA stands alone with nothing to contradict it and
+// the sign-in goes through. This is the same fix qutebrowser (also QtWebEngine)
+// ships as a default site quirk. Slack's web app fully supports Firefox.
 static const QString userAgent = QStringLiteral(
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36");
+    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) "
+    "Gecko/20100101 Firefox/140.0");
 
 static const QString slackUrl = QStringLiteral("https://app.slack.com/");
 static const QString slackSignInUrl = QStringLiteral("https://slack.com/signin");
@@ -295,11 +304,29 @@ MainWindow::MainWindow(QWidget *parent)
         "(function() {"
         "  var last = '';"
         "  var timer = null;"
-        "  var inner = null;"
+        "  var absentTimer = null;"
+        "  var attrObs = null;"
+        "  var watched = null;"
         "  function report() {"
         "    timer = null;"
         "    var el = document.querySelector('.p-theme_background');"
-        "    if (!el) return;"
+        "    if (!el) {"
+        // The theme element is gone — we've navigated out of a workspace (the
+        // launcher, sign-in, settings). Debounce it: a workspace *switch*
+        // detaches and re-mounts the element within a frame or two, and we
+        // don't want to flash the default titlebar in between.
+        "      if (!absentTimer) {"
+        "        absentTimer = setTimeout(function() {"
+        "          absentTimer = null;"
+        "          if (!document.querySelector('.p-theme_background') && last !== 'none') {"
+        "            last = 'none';"
+        "            console.log('__kslack_chrome__:none');"
+        "          }"
+        "        }, 800);"
+        "      }"
+        "      return;"
+        "    }"
+        "    if (absentTimer) { clearTimeout(absentTimer); absentTimer = null; }"
         "    var c = getComputedStyle(el).backgroundColor;"
         "    if (c && c !== last) {"
         "      last = c;"
@@ -310,27 +337,26 @@ MainWindow::MainWindow(QWidget *parent)
         "    if (timer) return;"
         "    timer = setTimeout(report, 50);"
         "  }"
-        "  function attach(el) {"
-        "    if (inner) return;"
-        "    inner = new MutationObserver(schedule);"
-        "    inner.observe(el, { attributes: true });"
+        // Track the current .p-theme_background node. A workspace switch swaps
+        // it for a fresh element, so re-anchor the attribute observer whenever
+        // the node identity changes (and tear it down when it disappears).
+        "  function sync() {"
+        "    var el = document.querySelector('.p-theme_background');"
+        "    if (el !== watched) {"
+        "      if (attrObs) { attrObs.disconnect(); attrObs = null; }"
+        "      watched = el;"
+        "      if (el) {"
+        "        attrObs = new MutationObserver(schedule);"
+        "        attrObs.observe(el, { attributes: true });"
+        "      }"
+        "    }"
         "    schedule();"
         "  }"
-        "  var existing = document.querySelector('.p-theme_background');"
-        "  if (existing) {"
-        "    attach(existing);"
-        "  } else {"
-        "    var wait = new MutationObserver(function() {"
-        "      var el = document.querySelector('.p-theme_background');"
-        "      if (el) {"
-        "        wait.disconnect();"
-        "        attach(el);"
-        "      }"
-        "    });"
-        "    wait.observe(document.body || document.documentElement,"
-        "                 { childList: true, subtree: true });"
-        "  }"
+        "  var tree = new MutationObserver(sync);"
+        "  tree.observe(document.body || document.documentElement,"
+        "               { childList: true, subtree: true });"
         "  setInterval(report, 5000);"
+        "  sync();"
         "})();"
     ));
     colorObserver.setInjectionPoint(QWebEngineScript::DocumentReady);
@@ -361,20 +387,47 @@ MainWindow::MainWindow(QWidget *parent)
                 popup->setWindowTitle(i18n("Sign in — KSlack"));
                 popup->setWindowIcon(QIcon::fromTheme(QStringLiteral("kslack")));
                 request.openIn(popup->page());
+
+                // The OAuth round-trip ends by handing control back to Slack.
+                // The popup only ever opens on a *non-Slack* IdP (the isSlackHost
+                // branch above keeps Slack URLs in the main view), so the first
+                // time the popup lands back on any slack.com host the session
+                // cookie is already in our shared jar and the flow is done.
+                // Earlier we only matched a handful of paths (/client, …); a
+                // brand-new-workspace handoff can land on a different path — or
+                // via window.open() — and dead-end the popup on a spinner even
+                // though login fully succeeded. Treat any return to Slack as
+                // completion: close the popup and reload the main view, which
+                // now resolves to the freshly authorised workspace.
+                auto done = std::make_shared<bool>(false);
+                auto finish = [this, popup, done](const QUrl &landed) {
+                    if (*done)
+                        return;
+                    *done = true;
+                    qWarning().noquote() << "[kslack] popup handoff" << landed.toString();
+                    m_view->load(QUrl(slackUrl));
+                    QTimer::singleShot(800, popup, &QWidget::close);
+                };
+
                 connect(popup->page(), &QWebEnginePage::windowCloseRequested,
                         popup, &QWidget::close);
-                connect(popup, &QWebEngineView::urlChanged, this,
-                        [this, popup](const QUrl &newUrl) {
-                            if (!isSlackHost(newUrl.host()))
+                // A window.open() from the handoff page must not dead-end: if it
+                // targets Slack, that *is* the handoff; otherwise keep it inside
+                // the same popup so the flow stays visible.
+                connect(popup->page(), &QWebEnginePage::newWindowRequested,
+                        this, [popup, finish](QWebEngineNewWindowRequest &req) {
+                            const QUrl u = req.requestedUrl();
+                            qWarning().noquote() << "[kslack] popup window.open" << u.toString();
+                            if (isSlackHost(u.host())) {
+                                finish(u);
                                 return;
-                            const auto path = newUrl.path();
-                            if (path.contains(QStringLiteral("/client"))
-                                || path.contains(QStringLiteral("/ssb/signin_redirect"))
-                                || path.contains(QStringLiteral("claimDeviceMultipass"))
-                                || path.contains(QStringLiteral("auth.loginMagic"))) {
-                                QTimer::singleShot(800, popup, &QWidget::close);
-                                m_view->load(QUrl(slackUrl));
                             }
+                            req.openIn(popup->page());
+                        });
+                connect(popup, &QWebEngineView::urlChanged, this,
+                        [finish](const QUrl &newUrl) {
+                            if (isSlackHost(newUrl.host()))
+                                finish(newUrl);
                         });
                 popup->show();
             });
@@ -668,10 +721,25 @@ void MainWindow::applyChromeColor(const QString &cssColor)
     m_lastChromeCss = cssColor;
     if (!m_titlebar)
         return;
+
+    if (cssColor == QLatin1String("none")) {
+        // The page reports no theme element — we're outside any workspace.
+        // Ignore it until a live theme has been seen at least once this
+        // session: during cold start the page is still loading and we want the
+        // pre-applied cached colour to stay put rather than flashing back to
+        // the default scheme for the whole load.
+        if (!m_chromeReported)
+            return;
+        qWarning().noquote() << "[kslack/chrome] no theme -> reset titlebar";
+        m_titlebar->reset();
+        return;
+    }
+
     const QColor c = parseCssColor(cssColor);
     if (!c.isValid())
         return;
     qWarning().noquote() << "[kslack/chrome]" << cssColor << "->" << c.name();
+    m_chromeReported = true;
     m_titlebar->applyExternal(c);
     setCachedColorFor(m_currentTeamId, c);
 }
@@ -684,6 +752,16 @@ void MainWindow::closeEvent(QCloseEvent *event)
         return;
     }
     KXmlGuiWindow::closeEvent(event);
+}
+
+void MainWindow::changeEvent(QEvent *event)
+{
+    // KWin on Wayland paints an unfocused window's titlebar with our scheme's
+    // *active* colour (it never reads the inactive group of a per-window
+    // scheme), so we dim it ourselves whenever the window loses focus.
+    if (event->type() == QEvent::ActivationChange && m_titlebar)
+        m_titlebar->setWindowActive(isActiveWindow());
+    KXmlGuiWindow::changeEvent(event);
 }
 
 void MainWindow::signIn()

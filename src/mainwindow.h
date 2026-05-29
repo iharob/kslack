@@ -29,6 +29,7 @@ public Q_SLOTS:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    void changeEvent(QEvent *event) override;
 
 private:
     enum class BadgeState { None, Unread, Mention };
@@ -49,6 +50,10 @@ private:
     BadgeState m_badgeState = BadgeState::None;
     QString m_lastChromeCss;
     QString m_currentTeamId;
+    // Set once the live page has reported a real theme colour. Gates the
+    // "no theme -> reset" path so cold-start (page still loading) keeps the
+    // pre-applied cached colour instead of flashing to the default scheme.
+    bool m_chromeReported = false;
 };
 
 #endif

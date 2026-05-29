@@ -10,7 +10,17 @@
 
 int main(int argc, char *argv[])
 {
-    qputenv("QTWEBENGINE_CHROMIUM_FLAGS", "--autoplay-policy=no-user-gesture-required");
+    // --disable-features=UserAgentClientHint stops Chromium from emitting the
+    // Sec-CH-UA / Sec-CH-UA-Platform client-hint headers. Those headers carry
+    // the *real* embedded-Chromium identity and contradict the Firefox UA we
+    // spoof (see userAgent in mainwindow.cpp), which is what makes Google's
+    // "this browser or app may not be secure" block flap intermittently on the
+    // add-a-Google-account sign-in. With the hints gone, the Firefox UA stands
+    // alone with nothing to give us away and the sign-in is reliable. Firefox
+    // never sends these hints anyway, so this is consistent, not suspicious.
+    qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
+            "--autoplay-policy=no-user-gesture-required "
+            "--disable-features=UserAgentClientHint");
     qputenv("QT_FORCE_STDERR_LOGGING", "1");
 
     QApplication app(argc, argv);
