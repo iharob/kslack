@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/iharob/kslack/compare/v1.5.0...v1.6.0) (2026-05-29)
+
+
+### Features
+
+* start hidden in the tray when launched via autostart ([05939f0](https://github.com/iharob/kslack/commit/05939f072b016d2cc04393cdd62040ec65ffe0bb))
+
 ## [1.5.0](https://github.com/iharob/kslack/compare/v1.4.0...v1.5.0) (2026-05-29)
 
 
