@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.0](https://github.com/iharob/kslack/compare/v1.2.0...v1.3.0) (2026-05-29)
+
+
+### Features
+
+* dynamic titlebar follows focus; reliable Google sign-in ([561a01d](https://github.com/iharob/kslack/commit/561a01d76f8babe4a36cad2e51b8147469e8c520))
+* remove external-browser sign-in and cookie-import flow ([80f77bc](https://github.com/iharob/kslack/commit/80f77bc5d1eef3917dbbb0a8a08c07987ee7905c))
+
 ## [1.2.0](https://github.com/iharob/kslack/compare/v1.1.0...v1.2.0) (2026-05-29)
 
 

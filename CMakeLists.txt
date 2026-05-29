@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(kslack VERSION 1.2.0 LANGUAGES CXX) # x-release-please-version
+project(kslack VERSION 1.3.0 LANGUAGES CXX) # x-release-please-version
 
 set(QT_MIN_VERSION "6.6.0")
 set(KF_MIN_VERSION "6.0.0")
