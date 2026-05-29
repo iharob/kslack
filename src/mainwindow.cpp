@@ -16,7 +16,6 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QWebEngineNewWindowRequest>
-#include <QMessageBox>
 #include <QNetworkCookie>
 #include <QPainter>
 #include <optional>
@@ -60,7 +59,6 @@ static const QString userAgent = QStringLiteral(
     "Gecko/20100101 Firefox/140.0");
 
 static const QString slackUrl = QStringLiteral("https://app.slack.com/");
-static const QString slackSignInUrl = QStringLiteral("https://slack.com/signin");
 
 static QString readLastTeam()
 {
@@ -175,15 +173,6 @@ protected:
                           << "type=" << int(type) << url.toString();
         if (!isMainFrame)
             return true;
-
-        // "I've logged in" button callback from the landing page.
-        if (url.scheme() == QStringLiteral("kslack")
-            && url.host() == QStringLiteral("auth-done")) {
-            QTimer::singleShot(0, m_owner, [w = m_owner]() {
-                w->finishImport(w->importFromFirefox() || w->importFromChrome());
-            });
-            return false;
-        }
 
         // Our own landing pages.
         const auto scheme = url.scheme();
@@ -517,11 +506,6 @@ void MainWindow::setupActions()
         if (m_view)
             m_view->reload();
     });
-
-    auto *signInAct = new QAction(QIcon::fromTheme(QStringLiteral("system-users")),
-                                  i18n("&Sign In via Browser..."), this);
-    actionCollection()->addAction(QStringLiteral("sign_in_browser"), signInAct);
-    connect(signInAct, &QAction::triggered, this, &MainWindow::signIn);
 }
 
 void MainWindow::setupTrayIcon()
@@ -533,11 +517,6 @@ void MainWindow::setupTrayIcon()
     else
         m_trayIcon->setIconByName(QStringLiteral("kslack"));
     m_trayIcon->setStandardActionsEnabled(true);
-
-    auto *signInAct = new QAction(QIcon::fromTheme(QStringLiteral("system-users")),
-                                  i18n("Sign In via Browser..."), this);
-    connect(signInAct, &QAction::triggered, this, &MainWindow::signIn);
-    m_trayIcon->contextMenu()->addAction(signInAct);
 
     auto *autostart = new QAction(i18n("Start automatically at login"), this);
     autostart->setCheckable(true);
@@ -762,211 +741,4 @@ void MainWindow::changeEvent(QEvent *event)
     if (event->type() == QEvent::ActivationChange && m_titlebar)
         m_titlebar->setWindowActive(isActiveWindow());
     KXmlGuiWindow::changeEvent(event);
-}
-
-void MainWindow::signIn()
-{
-    openInBrowser(QUrl(slackSignInUrl));
-    showSignInPage();
-}
-
-void MainWindow::showSignInPage()
-{
-    m_view->setHtml(QStringLiteral(
-        "<html><body style='background:#1a1d21;color:#fff;font-family:sans-serif;"
-        "display:flex;justify-content:center;align-items:center;height:100vh;margin:0'>"
-        "<div style='text-align:center;max-width:480px;padding:0 24px'>"
-        "<h2 style='margin-bottom:16px'>Finish signing in in your browser</h2>"
-        "<p style='color:#abadb1;line-height:1.6;margin-bottom:8px'>"
-        "Your default browser has opened the Slack sign-in page. "
-        "Enter your workspace URL, then complete the email magic-link or SSO flow there.</p>"
-        "<p style='color:#abadb1;line-height:1.6;margin-bottom:32px'>"
-        "When you see your Slack workspace loaded in the browser, come back here and click below "
-        "so KSlack can copy the session over.</p>"
-        "<a href='kslack://auth-done' style='"
-        "display:inline-block;background:#007a5a;color:#fff;font-weight:600;"
-        "padding:12px 32px;border-radius:4px;text-decoration:none;font-size:15px"
-        "'>I've signed in</a>"
-        "</div></body></html>"
-    ));
-}
-
-void MainWindow::finishImport(bool ok)
-{
-    if (ok) {
-        m_view->load(QUrl(slackUrl));
-        return;
-    }
-    QMessageBox::warning(this, i18n("Import Failed"),
-        i18n("Could not find Slack cookies in Firefox or Chrome.\n"
-             "Make sure you completed sign-in in your default browser, "
-             "then try again."));
-}
-
-bool MainWindow::importFromFirefox()
-{
-    QDir firefoxDir(QDir::homePath() + QStringLiteral("/.mozilla/firefox"));
-    if (!firefoxDir.exists())
-        return false;
-
-    const auto profiles = firefoxDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-    for (const auto &profile : profiles) {
-        const auto cookiesDb = firefoxDir.filePath(profile + QStringLiteral("/cookies.sqlite"));
-        if (!QFile::exists(cookiesDb))
-            continue;
-
-        const auto tempDb = QDir::tempPath() + QStringLiteral("/kslack-import.sqlite");
-        QFile::remove(tempDb);
-        if (!QFile::copy(cookiesDb, tempDb))
-            continue;
-
-        QProcess proc;
-        proc.start(QStringLiteral("sqlite3"),
-                   {QStringLiteral("-separator"), QStringLiteral("|"), tempDb,
-                    QStringLiteral("SELECT name, value, host, path, expiry, isSecure, isHttpOnly "
-                                   "FROM moz_cookies WHERE host LIKE '%slack.com'")});
-        proc.waitForFinished(5000);
-        QFile::remove(tempDb);
-
-        const auto output = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
-        if (output.isEmpty())
-            continue;
-
-        auto *store = m_view->page()->profile()->cookieStore();
-        bool found = false;
-
-        const auto lines = output.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        for (const auto &line : lines) {
-            const auto parts = line.split(QLatin1Char('|'));
-            if (parts.size() < 7)
-                continue;
-
-            QNetworkCookie cookie;
-            cookie.setName(parts[0].toUtf8());
-            cookie.setValue(parts[1].toUtf8());
-            cookie.setDomain(parts[2]);
-            cookie.setPath(parts[3]);
-            const auto expiry = parts[4].toLongLong();
-            if (expiry > 0)
-                cookie.setExpirationDate(QDateTime::fromSecsSinceEpoch(expiry));
-            cookie.setSecure(parts[5] == QLatin1String("1"));
-            cookie.setHttpOnly(parts[6].trimmed() == QLatin1String("1"));
-
-            store->setCookie(cookie, QUrl(slackUrl));
-            found = true;
-        }
-
-        if (found)
-            return true;
-    }
-    return false;
-}
-
-bool MainWindow::importFromChrome()
-{
-    struct BrowserInfo {
-        QString configDir;
-        QString walletFolder;
-    };
-    const BrowserInfo browsers[] = {
-        {QDir::homePath() + QStringLiteral("/.config/google-chrome"), QStringLiteral("Chrome Safe Storage")},
-        {QDir::homePath() + QStringLiteral("/.config/chromium"), QStringLiteral("Chromium Safe Storage")},
-    };
-
-    for (const auto &browser : browsers) {
-        const auto cookiesDb = browser.configDir + QStringLiteral("/Default/Cookies");
-        if (!QFile::exists(cookiesDb))
-            continue;
-
-        QProcess kwallet;
-        kwallet.start(QStringLiteral("kwallet-query"),
-                      {QStringLiteral("-f"), browser.walletFolder,
-                       QStringLiteral("-r"), browser.walletFolder,
-                       QStringLiteral("kdewallet")});
-        kwallet.waitForFinished(5000);
-        const auto password = QString::fromUtf8(kwallet.readAllStandardOutput()).trimmed();
-        if (password.isEmpty())
-            continue;
-
-        const auto tempDb = QDir::tempPath() + QStringLiteral("/kslack-chrome.sqlite");
-        QFile::remove(tempDb);
-        if (!QFile::copy(cookiesDb, tempDb))
-            continue;
-
-        QProcess sqlite;
-        sqlite.start(QStringLiteral("sqlite3"),
-                     {QStringLiteral("-separator"), QStringLiteral("|"), tempDb,
-                      QStringLiteral("SELECT name, hex(encrypted_value), host_key, path, "
-                                     "expires_utc, is_secure, is_httponly "
-                                     "FROM cookies WHERE host_key LIKE '%slack.com'")});
-        sqlite.waitForFinished(5000);
-        QFile::remove(tempDb);
-
-        const auto output = QString::fromUtf8(sqlite.readAllStandardOutput()).trimmed();
-        if (output.isEmpty())
-            continue;
-
-        QProcess deriveKey;
-        deriveKey.start(QStringLiteral("openssl"),
-                        {QStringLiteral("kdf"), QStringLiteral("-keylen"), QStringLiteral("16"),
-                         QStringLiteral("-kdfopt"), QStringLiteral("digest:SHA1"),
-                         QStringLiteral("-kdfopt"), QStringLiteral("pass:") + password,
-                         QStringLiteral("-kdfopt"), QStringLiteral("salt:saltysalt"),
-                         QStringLiteral("-kdfopt"), QStringLiteral("iter:1"),
-                         QStringLiteral("PBKDF2")});
-        deriveKey.waitForFinished(5000);
-        const auto keyHex = QString::fromUtf8(deriveKey.readAllStandardOutput()).trimmed()
-                                .remove(QLatin1Char(':')).remove(QLatin1Char('\n'));
-        if (keyHex.isEmpty())
-            continue;
-
-        auto *store = m_view->page()->profile()->cookieStore();
-        bool found = false;
-
-        const auto lines = output.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        for (const auto &line : lines) {
-            const auto parts = line.split(QLatin1Char('|'));
-            if (parts.size() < 7)
-                continue;
-
-            const auto encHex = parts[1];
-            // Chrome v11 prefix "v11" = 763131 in hex
-            if (!encHex.startsWith(QStringLiteral("763131")))
-                continue;
-            const auto cipherHex = encHex.mid(6);
-
-            QProcess decrypt;
-            decrypt.start(QStringLiteral("bash"),
-                          {QStringLiteral("-c"),
-                           QStringLiteral("echo '%1' | xxd -r -p | "
-                                          "openssl enc -d -aes-128-cbc -K '%2' "
-                                          "-iv '20202020202020202020202020202020'")
-                               .arg(cipherHex, keyHex)});
-            decrypt.waitForFinished(2000);
-            const auto value = QString::fromUtf8(decrypt.readAllStandardOutput());
-            if (value.isEmpty())
-                continue;
-
-            QNetworkCookie cookie;
-            cookie.setName(parts[0].toUtf8());
-            cookie.setValue(value.toUtf8());
-            cookie.setDomain(parts[2]);
-            cookie.setPath(parts[3]);
-            const auto expiresUtc = parts[4].toLongLong();
-            if (expiresUtc > 0) {
-                // Chrome expires_utc is microseconds since 1601-01-01.
-                const auto unixSecs = (expiresUtc / 1000000) - 11644473600LL;
-                cookie.setExpirationDate(QDateTime::fromSecsSinceEpoch(unixSecs));
-            }
-            cookie.setSecure(parts[5] == QLatin1String("1"));
-            cookie.setHttpOnly(parts[6].trimmed() == QLatin1String("1"));
-
-            store->setCookie(cookie, QUrl(slackUrl));
-            found = true;
-        }
-
-        if (found)
-            return true;
-    }
-    return false;
 }

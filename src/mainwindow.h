@@ -19,11 +19,6 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
 
-    void showSignInPage();
-    bool importFromFirefox();
-    bool importFromChrome();
-    void finishImport(bool ok);
-
 public Q_SLOTS:
     void applyChromeColor(const QString &cssColor);
 
@@ -42,7 +37,6 @@ private:
     void handleNotification(std::unique_ptr<QWebEngineNotification> notification);
     void updateBadgeFromTitle(const QString &title);
     void applyBadge(BadgeState state);
-    void signIn();
 
     QWebEngineView *m_view = nullptr;
     KStatusNotifierItem *m_trayIcon = nullptr;
