@@ -479,6 +479,51 @@ MainWindow::MainWindow(QWidget *parent)
         "      }"
         "    });"
         "  }"
+        // desktop.screen namespace. Slack's SSB build mirrors Electron's `screen`
+        // module here. Several desktop-gated surfaces (e.g. the Activity panel,
+        // which positions its popover relative to the display layout) call
+        // window.desktop.screen.getAllDisplays() DIRECTLY and immediately .map()
+        // over the result. Our Proxy fallback returns undefined, so `.map` throws
+        // ("Cannot read properties of undefined (reading 'map')") and the whole
+        // handler aborts — the rail icon never activates. Return a single
+        // Electron-shaped Display describing the page viewport so the math works.
+        // We derive the geometry from window.screen at call time rather than
+        // hard-coding it, so it tracks the real window. All distances are in
+        // density-independent (DIP) pixels, matching Electron.
+        "  function makeDisplay() {"
+        "    var w = (window.screen && window.screen.width) || window.innerWidth || 1920;"
+        "    var h = (window.screen && window.screen.height) || window.innerHeight || 1080;"
+        "    var aw = (window.screen && window.screen.availWidth) || w;"
+        "    var ah = (window.screen && window.screen.availHeight) || h;"
+        "    var dpr = window.devicePixelRatio || 1;"
+        "    return {"
+        "      id: 1, label: 'kslack-display-0',"
+        "      bounds: { x: 0, y: 0, width: w, height: h },"
+        "      workArea: { x: 0, y: 0, width: aw, height: ah },"
+        "      size: { width: w, height: h },"
+        "      workAreaSize: { width: aw, height: ah },"
+        "      scaleFactor: dpr, rotation: 0, internal: true,"
+        "      touchSupport: 'unknown', monochrome: false, accelerometerSupport: 'unknown',"
+        "      colorDepth: 24, colorSpace: 'srgb', depthPerComponent: 8, displayFrequency: 60"
+        "    };"
+        "  }"
+        "  function makeScreen() {"
+        "    var impl = {"
+        "      getAllDisplays: function() { return [makeDisplay()]; },"
+        "      getPrimaryDisplay: function() { return makeDisplay(); },"
+        "      getDisplayMatching: function() { return makeDisplay(); },"
+        "      getDisplayNearestPoint: function() { return makeDisplay(); },"
+        "      getCursorScreenPoint: function() { return { x: 0, y: 0 }; }"
+        "    };"
+        "    return new Proxy(function() {}, {"
+        "      get: function(t, prop) {"
+        "        if (prop in impl) return impl[prop];"
+        "        if (prop === 'then' || typeof prop === 'symbol') return undefined;"
+        "        if (prop in t) return t[prop];"
+        "        return KSLACK_DEBUG ? makeProbe('desktop.screen.' + String(prop)) : noop;"
+        "      }"
+        "    });"
+        "  }"
         "  var real = {"
         "    redux: {"
         "      getState: getState,"
@@ -486,7 +531,8 @@ MainWindow::MainWindow(QWidget *parent)
         "      subscribe: function() { return noop; }"
         "    },"
         "    dock: makeDock(),"
-        "    notice: makeNotice()"
+        "    notice: makeNotice(),"
+        "    screen: makeScreen()"
         "  };"
         // Some desktop methods are called DIRECTLY (window.desktop.foo()),
         // bypassing the null-safe bindDesktopMethod — a missing one throws and
